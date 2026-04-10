@@ -8,28 +8,27 @@ Build environment:
 - macOS 26.4
 - Stellaris v4.3.3 (Cetus) via Rosetta 2
 
+More details, including how to verify the install, are in the [longer docs](DOCS.md). 
+
 ---
 
 ## Quick Install
 
 1. Download the latest release zip
-2. **[Verify the download](#verifying-your-download)
-3. Extract it anywhere (e.g., your Downloads folder)
-4. Double-click **Install.command**
-5. Launch Stellaris via Steam
-6. In the Paradox launcher, choose **"Increased Stack Size"** from the launch options
-7. Play
+2. Extract it anywhere (e.g., your Downloads folder)
+3. Double-click the **Install.command**
+4. Launch Stellaris via Steam
+5. In the Paradox launcher, choose **"Increased Stack Size"** from the launch options
+6. Play
 
 To uninstall, double-click **Uninstall.command**.
 
-> If macOS warns that the `.command` file is from an unidentified developer, right-click (or Ctrl-click) the file, choose **Open**, then click **Open** in the dialog. You only need to do this once.
+> If macOS warns that the `.command` file is from an unidentified developer, right-click (or Ctrl-click) the file, choose **Open**, then click **Open** in the dialog. You should only have to do this once.
 
 
 ## What it fixes
 
-The short version: Stellaris is a Windows game ported to macOS, and it trips over several macOS platform defaults that are more conservative than Windows. It also has some use-after-free bugs that only manifest on macOS because of timing differences.
-
-More details, including how to verify the package, are in the [longer docs](DOCS.md). 
+The short version: Stellaris is a Windows game ported to macOS, and it trips over several macOS platform defaults that are more conservative than Windows. It also has some use-after-free bugs that likely only manifest on Mac because of timing differences.
 
 ### Fix 1: Thread stack overflow
 
