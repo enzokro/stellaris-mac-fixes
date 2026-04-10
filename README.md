@@ -4,11 +4,11 @@
 
 Large maps in Stellaris on macOS often crash around mid-game. This package fixes three crash groups without changing the game binary. When the game launches, a small support library is injected.
 
-Build environment:  
+Build environment:
 - macOS 26.4
 - Stellaris v4.3.3 (Cetus) via Rosetta 2
 
-More details, including how to verify the install, are in the [longer docs](DOCS.md). 
+More details, including how to verify the install, in the [longer docs](DOCS.md). 
 
 ---
 
