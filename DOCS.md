@@ -102,26 +102,27 @@ For verbose diagnostic output, set the environment variable `STELLARIS_FIX_DEBUG
 STELLARIS_FIX_DEBUG=1 %command%
 ```
 
-Then check the terminal output (or run Stellaris from Terminal) — you'll see messages like:
+The dylib writes a persistent log to `~/Documents/Paradox Interactive/Stellaris/stellaris-fix.log` on every launch regardless of `STELLARIS_FIX_DEBUG`. Each session starts with a header like:
 
 ```
-[stellaris-fix] v1.4.0 loaded
+=== [stellaris-fix] session start v1.10.3 pid=… time=… ===
+[stellaris-fix] text-bounds: stellaris=[0x100000000,0x103018000) found_main=1 images=256
 [stellaris-fix]   target stack: 8 MiB, floor: 1 MiB
 [stellaris-fix]   fd soft limit raised to 8192
-[stellaris-fix]   SIGSEGV recovery handler installed
-[stellaris-fix] attr_init: default stack → 8 MiB
-[stellaris-fix] pthread_create: NULL attrs → 8 MiB stack
-...
+[stellaris-fix] sigaction(SIGSEGV): chained handler …, installing recovery handler
 ```
 
-If the recovery handler catches a crash, you'll see one of:
+If the recovery handler catches a crash, you'll see one of the following messages followed by a parseable `SUMMARY` line:
 
 ```
 [stellaris-fix] recovered: bad-RIP call (direct ret)
 [stellaris-fix] recovered: bad-RIP call (stack scan)
+[stellaris-fix] recovered: data-segv (zero+skip)
+[stellaris-fix] recovered: data-segv (cmp flag-emulate)
+[stellaris-fix] recovered: data-segv (call no-op)
 ```
 
-The `direct ret` path handles crashes where the bad call came from Stellaris itself. The `stack scan` path handles crashes where it ended up inside an Apple GL/Metal driver call (e.g. during border rendering); the handler walks the stack to find the Stellaris frame that initiated the chain and unwinds to it.
+The first two are bad-RIP recoveries (the program jumped to a corrupted function pointer): `direct ret` simulates `ret` when the caller is in Stellaris itself; `stack scan` walks the stack to find the originating Stellaris frame when the bad call ended up inside an Apple GL/Metal driver. The last three are stale-pointer data-deref recoveries — `zero+skip` for a load through a freed object pointer, `cmp flag-emulate` for a condition check against a stale field, `call no-op` for a virtual-method dispatch through a dead vtable. Cascade faults (load recovery → NULL → next instruction faults) are handled in-line by the call/load recovery paths.
 
 ---
 
@@ -140,7 +141,7 @@ This restores `launcher-settings.json` from backup and removes the dylib and wra
 ## Compatibility
 
 - **macOS**: 11 (Big Sur) or later, tested on 26.4
-- **Stellaris**: tested through v4.3.5 (Cetus). Fix 1 (stack size) and Fix 2 (file descriptors) target stable POSIX APIs and aren't version-sensitive. Fix 3 (SIGSEGV recovery) hard-codes the Stellaris `__TEXT` segment range, which can shift across game updates — if a Stellaris update lands and crashes resume, rebuild from source against the new binary (the constant lives in `stellaris_fix.c`, with a verification one-liner alongside it).
+- **Stellaris**: tested through v4.3.7 (Cetus). Fix 1 (stack size) and Fix 2 (file descriptors) target stable POSIX APIs and aren't version-sensitive. Fix 3 (bad-RIP recovery) and Fix 4 (stale-pointer data-deref recovery) resolve the Stellaris `__TEXT` segment bounds and all loaded-image text ranges at constructor time by walking dyld, so the recovery surface auto-tracks across game updates — no per-version rebuild required. Compile-time defaults remain as fallback. The drift detector (Layer 4) watches the game binary and notifies if Steam ships a build where the dylib's compiled-in expectation diverges from the live `__TEXT` extent.
 - **Architecture**: Universal binary (arm64 + x86_64). Works on Intel Macs natively and Apple Silicon under Rosetta 2.
 - **System Integrity Protection**: Fully compatible — the game binary is unsigned so `DYLD_INSERT_LIBRARIES` works without needing SIP disabled.
 - **Steam**: Yes. Other stores (Epic, GOG, Paradox Store) should work if the layout matches; use `STELLARIS_DIR`.
@@ -198,11 +199,13 @@ The entire implementation is in a single C file: [`stellaris_fix.c`](stellaris_f
 
 ## How it works, briefly
 
-The library uses two macOS-specific mechanisms:
+The library uses three macOS-specific mechanisms:
 
 1. **DYLD interposition** via the `__DATA,__interpose` Mach-O section to intercept `pthread_create`, `pthread_attr_init`, `pthread_attr_setstacksize`, and `sigaction`. The dynamic linker replaces references to these symbols in the game and all other loaded images with our versions. Calls within our own library still go to the real functions, so there's no recursion.
 
-2. **Signal-handler recovery** for crashes that can't be intercepted via DYLD (because they happen through direct intra-binary calls or through Apple-driver call chains). A SIGSEGV handler detects instruction-fetch faults (where the faulting address equals the current `RIP` — the canonical signature of a corrupted function-pointer call) and unwinds by either simulating a `ret` instruction directly, or scanning the stack to find the originating Stellaris frame and unwinding to it when the bad call happened inside an Apple driver.
+2. **Mach exception port handling** as the primary fault-recovery path. The constructor installs a custom Mach exception handler for `EXC_BAD_ACCESS` on the task port and runs a dedicated server thread. The kernel delivers the fault to our handler *before* it would be converted into a SIGSEGV, so we can read `x86_thread_state64_t` directly, decide whether to recover, and return `KERN_SUCCESS` with a mutated state — or `KERN_FAILURE` to let the kernel proceed to the signal path. A chained sigaction handler is also installed as defense-in-depth in case the Mach port path is preempted by another consumer.
+
+3. **Two recovery paths sharing the same decision logic** (`sfix_attempt_recovery`). For *bad-RIP faults* (the corrupted function-pointer-call class), the handler simulates a `ret` instruction directly when the caller is in Stellaris, or scans the stack to find the originating Stellaris frame and unwinds to it when the bad call ended up inside an Apple GL/Metal driver. For *stale-pointer data-deref faults*, the handler decodes the faulting instruction (MOV-load, CMP-against-memory, or indirect CALL-through-memory), applies a shape-specific recovery (zero+skip the destination register, emulate RFLAGS, or no-op the virtual method), and advances past the instruction. The faulting RIP is validated against the runtime-resolved `__TEXT` segments of every loaded image, so framework-RIP faults are eligible for recovery too.
 
 The library is loaded via `DYLD_INSERT_LIBRARIES` — this requires the target binary to be either unsigned or have the `com.apple.security.cs.disable-library-validation` entitlement. The Stellaris macOS build is unsigned, so injection works without needing SIP to be disabled.
 

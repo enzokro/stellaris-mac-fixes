@@ -6,7 +6,7 @@ Large maps in Stellaris on macOS often crash around mid-game. This package fixes
 
 Build environment:
 - macOS 26.4
-- Stellaris v4.3.5 (Cetus) via Rosetta 2 (works on adjacent versions; see Compatibility in [DOCS.md](DOCS.md))
+- Stellaris v4.3.7 (Cetus) via Rosetta 2 (works on adjacent versions; see Compatibility in [DOCS.md](DOCS.md))
 
 More details, including how to verify the install, in the [longer docs](DOCS.md). 
 
@@ -30,7 +30,7 @@ To uninstall, double-click **Uninstall.command**.
 
 Four layers, installed by the same `install.sh`:
 
-- **Layer 1 — the dylib** (`libstellaris_fix.dylib`). Binary-level crash recovery in five classes: thread stack overflow, file descriptor exhaustion, bad-RIP use-after-free (vtable corruption — recovery via direct return or stack scan), NULL/near-NULL data loads (recovery by zeroing the destination register and skipping the instruction), and the Mach exception port handler that catches faults at the kernel level before any signal is generated. Catches faults at the moment of crash. Loads via `DYLD_INSERT_LIBRARIES` through the Paradox launcher's "Increased Stack Size" entry. Emits one parseable `SUMMARY` line per fault with a stable FNV-1a crash signature hash. Recovery decision logic is shared between the Mach handler (primary path) and the sigaction handler (defense-in-depth fallback) — same `sfix_attempt_recovery` helper, two delivery mechanisms.
+- **Layer 1 — the dylib** (`libstellaris_fix.dylib`). Binary-level crash recovery covering thread stack overflow, file descriptor exhaustion, bad-RIP use-after-free (vtable corruption — recovery via direct return or stack scan), and stale/NULL-pointer data-derefs across three instruction shapes: MOV-loads (zero destination register and skip), CMP-immediate against memory (emulate RFLAGS for the comparison and skip), and indirect CALL through memory (no-op the virtual method and skip). Faults are delivered through the Mach exception port handler (primary path, kernel-level before any signal is generated) with a sigaction handler as defense-in-depth fallback — both share the same `sfix_attempt_recovery` helper. Loads via `DYLD_INSERT_LIBRARIES` through the Paradox launcher's "Increased Stack Size" entry. `__TEXT` segment bounds and all loaded-image text ranges are resolved at constructor time by walking dyld, so the recovery surface auto-tracks across game updates without per-version rebuilds. Emits one parseable `SUMMARY` line per fault with a stable FNV-1a crash signature hash.
 - **Layer 2 — the companion mod** (`companion-mod/`). Script-level CTD prevention: 13 focused defensive fixes mined from `~~Stellaris [v4.3] General Fixes` (workshop ID 3701747681). Stops the script-level bug conditions producing many of the crashes the dylib would otherwise have to recover from. **Disables Steam achievements** like every other Stellaris script fix mod — disable it in the launcher for ironman runs; the dylib still loads independently. See [companion-mod/README.md](companion-mod/README.md) for details.
 - **Layer 3 — the doctor** (`bin/stellaris-fix-doctor`). Read-only health check that reads the dylib log + crash bundles + live game binary and prints what's installed, what's drifted, what crashed, and what's been recovered. Run it after a play session to see how things went. `--json` for tooling.
 - **Layer 4 — the drift detector** (launchd agent `com.stellaris-fix.drift`). Watches the Stellaris game binary; when Steam updates the game and the binary's text segment shifts, posts a macOS notification telling you to rebuild and reinstall the dylib. Silent the rest of the time.
@@ -80,4 +80,19 @@ The address after `???` is whatever garbage filled the freed slot — `0x0` and 
 - **Stack scan** when the corrupted call ended up inside an Apple driver call (e.g. during border rendering): walk the stack to find the Stellaris frame that initiated the chain and unwind to that frame, cancelling the foreign call entirely. At most one render frame is affected; the next retries.
 
 Rate-limited (max 32 recoveries per 5 seconds) to prevent infinite loops if recovery causes immediate re-failure. Crashes that don't match this signature fall through to the game's normal crash reporter.
+
+### Fix 4: Stale-pointer data-deref crashes
+
+**Symptom:** Crashes deep in Stellaris frames (or framework frames called from Stellaris) where the OS reports a faulting address that looks like a real heap pointer (e.g. `si_addr=0x7fb7078c9410`) rather than NULL. Usually preceded by a flood of `Script Error: Invalid context switch [assembling_species]` / `[owner]` / `[contact_country]` entries in `error.log` with `opener_id=4294967295` — the upstream signal of orphaned game-object references.
+
+**Cause:** The script side leaks a reference to a freed game object (planet, country, species); the C++ code later dereferences the stale pointer. Three instruction shapes dominate in real crashes: loading a field through the stale pointer (`mov rax, [rdi]`), checking a flag on the stale object (`cmp byte [rdi+0x30], 0`), and dispatching a virtual method through the stale vtable (`call [rax+0x68]`). When the load form recovers by zeroing a register, the next instruction can cascade-fault on the now-NULL pointer — the dylib handles the cascade in-line.
+
+**Fix:** The library decodes the faulting instruction and applies a shape-specific recovery:
+- **MOV-load** (`mov reg, [base+disp]`): zero the destination register, advance RIP past the load. The downstream code sees a NULL value where it expected a real object — a defensive null-check takes the safe branch; a missing null-check cascades into one of the other shapes and recovers there.
+- **CMP against memory** (`cmp [base+disp], imm`): emulate the RFLAGS state of `(0 - imm)` per the standard SUB rules (CF/PF/AF/ZF/SF/OF), preserve the other RFLAGS bits, advance RIP. The downstream conditional branch takes the "field was zero" path.
+- **Indirect CALL through memory** (`call [base+disp]`): skip the call, set RAX=RDX=0 to simulate the virtual method returning `(0, 0)` per the SysV AMD64 ABI. The dispatching loop continues past the dead element.
+
+Same rate-limit (32 recoveries / 5 s) as Fix 3. Kill switch: set `STELLARIS_FIX_NO_STALE_PTR=1` in Steam launch options to disable the high-`si_addr` recovery branch and fall back to NULL-only recovery (v1.8.1 behavior) if a regression appears. Each recovery emits a distinct `SUMMARY` tag (`data-recovered`, `data-recovered-cmp`, `data-recovered-call`) so the doctor can group recoveries by class.
+
+The companion mod (Layer 2) addresses the *upstream* condition by guarding the script sites that produce the orphan references in the first place — the dylib catches the binary-level fault either way, but with the companion mod enabled the fault stops happening on save-load-correlated patterns.
 
