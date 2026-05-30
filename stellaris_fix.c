@@ -46,7 +46,7 @@
 
 /* ── Configuration ────────────────────────────────────────────────────── */
 
-#define STELLARIS_FIX_VERSION   "1.10.3"
+#define STELLARIS_FIX_VERSION   "1.10.4"
 #define TARGET_STACK_SIZE       (8UL * 1024 * 1024)   /* 8 MiB */
 #define MIN_STACK_THRESHOLD     (1UL * 1024 * 1024)   /* Floor for explicit setstacksize */
 #define TARGET_NOFILE           8192
@@ -485,10 +485,12 @@ static void sfix_log_summary_data_segv(uint64_t rip, uint64_t si_addr,
     if (g_log_fd < 0) return;
     /* Read the instruction byte at RIP defensively. trigger=skip means RIP
      * is mapped/executable (the fault was at si_addr, not rip), so the
-     * read should be safe. */
+     * read should be safe. Gate on any loaded image's text — same surface
+     * as the recovery path — otherwise framework-RIP crashes log op=?
+     * and we lose the one byte that says which decoder rejected it. */
     uint8_t op = 0;
     int op_ok = 0;
-    if (rip >= STELLARIS_TEXT_START && rip < STELLARIS_TEXT_END) {
+    if (sfix_rip_in_any_text(rip)) {
         op = *(const volatile uint8_t *)rip;
         op_ok = 1;
     }
@@ -674,19 +676,31 @@ static uint64_t *sfix_thread_state_reg_ptr(x86_thread_state64_t *s, int idx) {
  * (with *dest_reg_idx set to 0..15), or 0 if not a recognized pattern.
  *
  * Recognized patterns (REX-prefix variants only — we want 64-bit ops):
- *   REX.W=1  8B /r              mov r64, r/m64    with mod=00 or 01,
- *                                                  r/m != 100 (no SIB),
- *                                                  r/m != 101 (no RIP-rel).
+ *   REX.W=1  8B /r              mov r64, r/m64    with mod=00, 01, or 10.
+ * Addressing modes accepted:
+ *   [reg]                       mod=00, rm != 4, rm != 5
+ *   [reg+disp8]                 mod=01, rm != 4
+ *   [reg+disp32]                mod=10, rm != 4
+ *   [base]      via SIB         mod=00, rm=4, sib.index=4, sib.base != 5
+ *   [base+disp8]  via SIB       mod=01, rm=4, sib.index=4
+ *   [base+disp32] via SIB       mod=10, rm=4, sib.index=4
  * That covers the canonical vtable / object-field deref:
  *   mov rax, [rdi]              48 8B 07           (mod=00, rm=7)
  *   mov rax, [rdi+0x10]         48 8B 47 10        (mod=01, rm=7, disp8=0x10)
  *   mov rdx, [rax+0x8]          48 8B 50 08        (etc.)
+ *   mov rax, [r12]              49 8B 04 24        (SIB-form; r12/rsp need SIB
+ *                                                   because their bottom 3 bits
+ *                                                   collide with the rm=4
+ *                                                   sentinel)
+ *   mov rcx, [rsp+0x40]         48 8B 4C 24 40
  * With REX.R the dest can be r8..r15 too.
  *
- * We REJECT writes (mov r/m64, r64 — opcode 0x89), SIB-form addressing,
- * RIP-relative addressing, and 32-bit / 16-bit / 8-bit variants. Adding
- * those is straightforward but each new pattern is a chance to misdecode
- * something; ship the simplest set and grow it from real-world data. */
+ * We REJECT writes (mov r/m64, r64 — opcode 0x89), SIB with a scaled index
+ * register ([base + index*scale] — either pointer could be the stale one,
+ * and we don't want to silently zero a register that wasn't to blame),
+ * SIB with mod==0 base==5 (disp32-only, no base register), RIP-relative
+ * addressing, and 32-bit / 16-bit / 8-bit variants. Each new pattern is a
+ * chance to misdecode something; widen from real-world data. */
 static int sfix_decode_simple_load(const uint8_t *pc, int *dest_reg_idx) {
     int off = 0;
     uint8_t rex = 0;
@@ -707,20 +721,28 @@ static int sfix_decode_simple_load(const uint8_t *pc, int *dest_reg_idx) {
     uint8_t reg = ((modrm >> 3) & 7) | ((rex & 0x04) ? 8 : 0);  /* +REX.R */
     uint8_t rm  = modrm & 7;
 
-    /* Reject SIB (rm==4 unless mod==3, but we already reject mod==3 below). */
-    if (rm == 4) return 0;
+    /* Reject register-direct mod (no memory access — won't fault on deref). */
+    if (mod == 3) return 0;
     /* Reject RIP-relative (mod==0, rm==5). Our recovery doesn't make sense
      * for those — they don't deref a register-held pointer. */
     if (mod == 0 && rm == 5) return 0;
-    /* Reject register-direct mod (no memory access — won't fault on NULL). */
-    if (mod == 3) return 0;
-    /* Accept mod==0 (no disp), mod==1 (disp8), or mod==2 (disp32). All three
-     * are object-field derefs with the same shape — `[reg]`, `[reg+disp8]`,
-     * `[reg+disp32]`. Vtable thunks with offsets >=128 emit mod==2 (e.g.
-     * `mov rcx, [rcx+0x218]`); seen in 4.3.5 telemetry. */
-    if (mod != 0 && mod != 1 && mod != 2) return 0;
 
-    if (mod == 1) off += 1;  /* disp8 */
+    /* SIB byte (rm==4 in 64-bit mode means "SIB follows"). We accept the
+     * no-index subset, which is the encoding the toolchain emits whenever
+     * the base register's low 3 bits collide with the rm=4 sentinel
+     * (rsp, r12). With sib.index=4 the addressing mode reduces to plain
+     * [base] / [base+disp], same recovery semantics as the non-SIB form.
+     * Reject the mod==0/base==5 form (no base register, disp32 absolute),
+     * and reject scaled-index forms. */
+    if (rm == 4) {
+        uint8_t sib   = pc[off++];
+        uint8_t index = (sib >> 3) & 7;
+        uint8_t base  = sib & 7;
+        if (index != 4) return 0;
+        if (mod == 0 && base == 5) return 0;
+    }
+
+    if (mod == 1) off += 1;       /* disp8 */
     else if (mod == 2) off += 4;  /* disp32 */
 
     *dest_reg_idx = reg;

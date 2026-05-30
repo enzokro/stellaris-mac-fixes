@@ -22,10 +22,15 @@ static int decode_load(const uint8_t *pc, int *dest_reg_idx) {
     uint8_t mod = (modrm >> 6) & 3;
     uint8_t reg = ((modrm >> 3) & 7) | ((rex & 0x04) ? 8 : 0);
     uint8_t rm  = modrm & 7;
-    if (rm == 4) return 0;
-    if (mod == 0 && rm == 5) return 0;
     if (mod == 3) return 0;
-    if (mod != 0 && mod != 1 && mod != 2) return 0;
+    if (mod == 0 && rm == 5) return 0;
+    if (rm == 4) {
+        uint8_t sib   = pc[off++];
+        uint8_t index = (sib >> 3) & 7;
+        uint8_t base  = sib & 7;
+        if (index != 4) return 0;
+        if (mod == 0 && base == 5) return 0;
+    }
     if (mod == 1) off += 1;
     else if (mod == 2) off += 4;
     *dest_reg_idx = reg;
@@ -126,11 +131,22 @@ int main(void) {
         { "mov rdx, [rax+0x8]",  {0x48, 0x8B, 0x50, 0x08},                4, 2 },
         { "mov r8, [rdi+0x10]",  {0x4C, 0x8B, 0x47, 0x10},                4, 8 },
         { "mov rcx,[rcx+0x218]", {0x48, 0x8B, 0x89, 0x18, 0x02, 0x00, 0x00}, 7, 1 },
+        /* SIB-no-index accepts (v1.10.4) — the AppleMetalOpenGLRenderer
+         * crash on 2026-05-29 faulted on this exact byte pattern via r12. */
+        { "mov rax, [r12]",      {0x49, 0x8B, 0x04, 0x24},                4, 0 },
+        { "mov rax, [rsp]",      {0x48, 0x8B, 0x04, 0x24},                4, 0 },
+        { "mov rbx, [r12+0x10]", {0x49, 0x8B, 0x5C, 0x24, 0x10},          5, 3 },
+        { "mov rcx, [rsp+0x40]", {0x48, 0x8B, 0x4C, 0x24, 0x40},          5, 1 },
+        { "mov r9, [r12+0x200]", {0x4D, 0x8B, 0x8C, 0x24, 0x00, 0x02, 0x00, 0x00}, 8, 9 },
+        /* Rejects */
         { "WRITE: mov [rdi],rax",{0x48, 0x89, 0x07},                      0, 0 },
-        { "SIB: mov rax,[rsp]",  {0x48, 0x8B, 0x04, 0x24},                0, 0 },
         { "RIP-rel mov",         {0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00}, 0, 0 },
         { "32-bit mov eax",      {0x8B, 0x07},                            0, 0 },
         { "reg-direct mov",      {0x48, 0x8B, 0xC7},                      0, 0 },
+        /* SIB-scaled-index — reject (either base or index could be stale). */
+        { "SIB scaled: [rax+rbx*8]", {0x48, 0x8B, 0x04, 0xD8},            0, 0 },
+        /* SIB disp32-only (mod=0, base=5) — no base register to blame. */
+        { "SIB disp32-only",     {0x48, 0x8B, 0x04, 0x25, 0x78, 0x56, 0x34, 0x12}, 0, 0 },
     };
 
     /* Flag-bit indices in our test-local packing: CF=0,PF=1,AF=2,ZF=3,SF=4,OF=5 */

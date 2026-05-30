@@ -36,7 +36,7 @@ DOCTOR="$SCRIPT_DIR/bin/stellaris-fix-doctor"
 
 # Expected MD5 of the bundled dylib. Updated by `make release`.
 # Set SKIP_CHECKSUM_VERIFY=1 to bypass (for devs who rebuild locally).
-EXPECTED_DYLIB_MD5="a266b05af9036b2506da38805a401ef4"
+EXPECTED_DYLIB_MD5="598a3bb9e922e54ef84c167967f4e876"
 SKIP_CHECKSUM_VERIFY="${SKIP_CHECKSUM_VERIFY:-0}"
 
 # ── Pretty output ─────────────────────────────────────────────────────────

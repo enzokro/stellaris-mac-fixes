@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.10.4 — SIB-form load recovery + honest op= logging
+
+CTD captured 2026-05-29 23:46 (v1.10.3 dylib live, recovery declined):
+
+```
+[stellaris-fix] mach-exc: rip=0x11fbfb7a8 si_addr=0x7f64e5299c20 ... trigger=skip
+[stellaris-fix] SUMMARY  path=data-segv rip=0x11fbfb7a8 si_addr=0x7f64e5299c20 ... op=?
+[stellaris-fix] sigsegv: rip=0x11fbfb7a8 si_addr=0x7f64e5299c20 ... trigger=skip
+```
+
+Stack: `glDrawElements_ACC_Exec` → `gldUpdateDispatch` → `GLDContextRec::loadCurrentVertexArray+485` inside `AppleMetalOpenGLRenderer.bundle`. RIP `0x11fbfb7a8` sits in the preceding function (`GLDContextRec::generateMipmapsWithCPUAsync` block invoke); slide-adjusted file offset `0x527a8`. The instruction is:
+
+```
+0x527a8:  49 8b 04 24            mov rax, [r12]
+0x527ac:  48 89 e7               mov rdi, r12
+0x527af:  49 89 f4               mov r12, rsi
+0x527b2:  ff 50 10               call qword [rax+0x10]    ← cascade target
+```
+
+A textbook stale-`this` deref: load `[r12]` into rax for vmethod dispatch through `[rax+0x10]`. Upstream signal was the same `Invalid context switch [assembling_species]` flood from `on_all_capital_buildings.txt:203` we've been chasing — the stale ref reached Apple's GL driver before the fault landed.
+
+**Two gaps closed:**
+
+1. **Load decoder rejected SIB.** `mov rax, [r12]` encodes as `49 8b 04 24` — REX.W+B, opcode 8B, ModR/M(mod=0, reg=0, rm=4), SIB(scale=0, index=4, base=4). The rm=4 sentinel means "SIB follows" in 64-bit mode; r12 and rsp can only be encoded this way because their low 3 bits collide with that sentinel. v1.10.3's decoder rejected SIB unconditionally (`if (rm == 4) return 0;`).
+
+   **Fix:** accept the SIB-no-index subset (`sib.index == 4`), which reduces to plain `[base]` / `[base+disp8]` / `[base+disp32]` — same recovery semantics as the non-SIB form, +1 byte for the SIB. Still reject scaled-index (`[base + index*scale]` — either pointer could be the stale one, and silently zeroing the wrong dest register is worse than declining recovery) and the `mod=0/base=5` disp32-only form (no base register to blame).
+
+2. **`op=?` logger was lying.** `sfix_log_summary_data_segv` only read the opcode byte when `rip ∈ [STELLARIS_TEXT_START, STELLARIS_TEXT_END)`. The *recovery* path uses `sfix_rip_in_any_text(rip)` (any loaded image) since v1.9, but the logger never got that update. Every framework-RIP fault in the log history shows `op=?` not because the decoder failed to classify it, but because we refused to read the byte. Cost: misleading diagnostic; we'd have caught the SIB gap sooner if today's crash had logged `op=8b` instead of `op=?`.
+
+   **Fix:** gate the byte-read on `sfix_rip_in_any_text(rip)` so framework RIPs log their actual opcode.
+
+**Cascade prediction.** Once the load recovers (zero rax, RIP += 4), the next instruction at `0x527ac` runs `mov rdi, r12` and `mov r12, rsi` (both safe — no deref of rax). Then `call qword [rax+0x10]` faults at si_addr=0x10 with op=ff. That instruction (`ff 50 10`) is already covered by v1.10.3's indirect-call recovery (decoder accepts `ff /2` with mod∈{0,1,2}, no SIB) — sets rax=rdx=0 and skips. Cascade resolves in two recoveries with no decoder additions.
+
+**Test coverage.** `test_decoder.c` flips the existing `mov rax, [rsp]` case from reject→accept (same bytes that crashed tonight via r12), adds `[r12]` / `[r12+disp8]` / `[r12+disp32]` / `[rsp+disp8]` / r9-dest cases, and adds two new rejects (SIB scaled-index, SIB disp32-only). All 39 decoder cases pass; 7/7 interpose+recovery suite remains green.
+
 ## v1.10.3 — indirect-call recovery for vtable-dispatch cascades
 
 CTD captured 2026-05-29 22:38 exposed a recovery cascade we hadn't yet handled:
