@@ -17,9 +17,26 @@ DYLIB="libstellaris_fix.dylib"
 WRAPPER="stellaris_wrapper.sh"
 LAUNCHER="launcher-settings.json"
 
+# Companion mod (script-level CTD prevention). Optional — installer skips
+# silently if companion-mod/ directory is absent (lets users opt out by
+# deleting the directory before running install).
+COMPANION_MOD_DIR="$SCRIPT_DIR/companion-mod"
+COMPANION_MOD_NAME="stellaris-mac-fixes-companion"
+PDX_MOD_DIR="$HOME/Documents/Paradox Interactive/Stellaris/mod"
+COMPANION_POINTER="$PDX_MOD_DIR/${COMPANION_MOD_NAME}.mod"
+
+# Layer 4/5 — observability + lifecycle.
+SIDECAR_DIR="$HOME/.config/stellaris-mac-fixes"
+SIDECAR_EXPECTED="$SIDECAR_DIR/expected_text_end"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/com.stellaris-fix.drift.plist"
+LAUNCHD_LABEL="com.stellaris-fix.drift"
+PLIST_TEMPLATE="$SCRIPT_DIR/com.stellaris-fix.drift.plist.template"
+DRIFT_CHECK="$SCRIPT_DIR/bin/stellaris-fix-drift-check"
+DOCTOR="$SCRIPT_DIR/bin/stellaris-fix-doctor"
+
 # Expected MD5 of the bundled dylib. Updated by `make release`.
 # Set SKIP_CHECKSUM_VERIFY=1 to bypass (for devs who rebuild locally).
-EXPECTED_DYLIB_MD5="5fb5604a1b4a3df071931bea7d872e67"
+EXPECTED_DYLIB_MD5="e458d0bc2120ec1d4bcdebcb7cd73799"
 SKIP_CHECKSUM_VERIFY="${SKIP_CHECKSUM_VERIFY:-0}"
 
 # ── Pretty output ─────────────────────────────────────────────────────────
@@ -66,6 +83,44 @@ if [ ! -f "$MACOS_DIR/stellaris" ]; then
     exit 1
 fi
 ok "Found game binary"
+
+# ── Capture Paradox launcher app version (observational) ─────────────────
+#
+# The Paradox bootstrapper keeps multiple launcher-v2.* dirs around and runs
+# the newest one with a valid .cpatch marker. We record whichever is active
+# so we can spot when it shifts between installs — the launcher app updates
+# independently of the game binary and isn't tracked elsewhere.
+
+step "Checking Paradox launcher version"
+
+PDX_DIR="$HOME/Library/Application Support/Paradox Interactive"
+STATE_DIR="$HOME/.local/state/stellaris-mac-fixes"
+STATE_LOG="$STATE_DIR/install.log"
+
+LAUNCHER_VERSION=""
+if [ -d "$PDX_DIR" ]; then
+    while IFS= read -r dir; do
+        [ -f "$dir/.cpatch/launcher-v2_1/version" ] || continue
+        LAUNCHER_VERSION="${dir##*/launcher-v2.}"
+    done < <(find "$PDX_DIR" -maxdepth 1 -type d -name 'launcher-v2.*' 2>/dev/null | sort -V)
+fi
+
+if [ -z "$LAUNCHER_VERSION" ]; then
+    warn "Paradox launcher not detected — skipping version log."
+else
+    ok "Active Paradox launcher: $LAUNCHER_VERSION"
+    if [ -f "$STATE_LOG" ]; then
+        prev=$(grep 'launcher-app-version:' "$STATE_LOG" 2>/dev/null | tail -1 | awk '{print $NF}')
+        if [ -n "$prev" ] && [ "$prev" != "$LAUNCHER_VERSION" ]; then
+            info "(was $prev at last install)"
+        elif [ -n "$prev" ]; then
+            info "(unchanged since last install)"
+        fi
+    fi
+    mkdir -p "$STATE_DIR"
+    printf '%s\tlauncher-app-version: %s\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$LAUNCHER_VERSION" >> "$STATE_LOG"
+fi
 
 # ── Locate or build the dylib ─────────────────────────────────────────────
 
@@ -168,16 +223,18 @@ if [ ! -f "$LAUNCHER_PATH" ]; then
     exit 0
 fi
 
-# Back up the original (only on first install)
-if [ ! -f "$LAUNCHER_PATH.bak" ]; then
-    cp "$LAUNCHER_PATH" "$LAUNCHER_PATH.bak"
-    ok "Backed up original $LAUNCHER → $LAUNCHER.bak"
+# Snapshot a pristine .bak whenever the current file is in an unpatched state
+# (first install, or after a Steam game-update refreshed launcher-settings.json
+# and wiped our wrapper entry). Don't blindly restore from .bak — that would
+# overwrite a freshly-deployed launcher config with stale content. Idempotency
+# is enforced inside the python patcher instead (it strips existing wrapper
+# entries before inserting).
+if grep -q "$WRAPPER" "$LAUNCHER_PATH"; then
+    info "$LAUNCHER already contains wrapper entry — patching in place (idempotent)"
 else
-    info "Backup already exists: $LAUNCHER.bak"
+    cp "$LAUNCHER_PATH" "$LAUNCHER_PATH.bak"
+    ok "Snapshotted pristine $LAUNCHER → $LAUNCHER.bak"
 fi
-
-# Re-patch from the backup so we don't double-apply on repeated installs
-cp "$LAUNCHER_PATH.bak" "$LAUNCHER_PATH"
 
 if ! command -v python3 >/dev/null 2>&1; then
     warn "python3 not found — cannot patch $LAUNCHER automatically"
@@ -215,6 +272,8 @@ fix_entry = {
 }
 
 alts = cfg.get('alternativeExecutables', [])
+# Idempotency: drop any pre-existing wrapper entries before inserting fresh.
+alts = [e for e in alts if e.get('exePath') != fix_entry['exePath']]
 alts.insert(0, fix_entry)
 cfg['alternativeExecutables'] = alts
 
@@ -224,6 +283,103 @@ with open(path, 'w') as f:
 PYTHON_EOF
 ok "Patched $LAUNCHER"
 
+# ── Companion mod (optional) ──────────────────────────────────────────────
+
+COMPANION_INSTALLED=0
+if [ -d "$COMPANION_MOD_DIR" ]; then
+    step "Registering companion mod (script-level CTD prevention)"
+
+    missing=0
+    for f in descriptor.mod thumbnail.png \
+             common/on_actions/zz_smf_companion.txt \
+             events/smf_planet_transfer.txt \
+             events/smf_dead_war.txt \
+             events/smf_army_counter.txt \
+             events/smf_save_repair.txt \
+             events/smf_dlc_cyber.txt \
+             events/smf_dlc_anomaly.txt \
+             events/!smf_overrides.txt; do
+        if [ ! -f "$COMPANION_MOD_DIR/$f" ]; then
+            warn "Companion mod missing: $f"
+            missing=1
+        fi
+    done
+
+    if [ "$missing" = "1" ]; then
+        warn "Companion mod files incomplete — skipping registration."
+        warn "The dylib is still installed and active."
+    else
+        mkdir -p "$PDX_MOD_DIR"
+        cat > "$COMPANION_POINTER" << POINTER_EOF
+name="Stellaris Mac CTD Fixes (companion)"
+version="0.1.0"
+tags={
+	"Fixes"
+}
+supported_version="v4.3.*"
+picture="thumbnail.png"
+path="$COMPANION_MOD_DIR"
+POINTER_EOF
+        ok "Wrote launcher pointer: $COMPANION_POINTER"
+        COMPANION_INSTALLED=1
+    fi
+fi
+
+# ── Sidecar: expected __DATA vmaddr ────────────────────────────────────────
+#
+# Extract STELLARIS_TEXT_END from stellaris_fix.c so the doctor and the drift
+# detector can compare it against the live game binary without re-parsing the
+# .c source on every run. Idempotent — re-install overwrites with the current
+# value.
+
+step "Writing sidecar (expected game __DATA vmaddr)"
+
+EXPECTED_TEXT_END=$(awk '/^#define[[:space:]]+STELLARIS_TEXT_END_DEFAULT[[:space:]]+/{
+    val=$3; gsub(/[ULul]+$/, "", val); print val; exit
+}' "$SCRIPT_DIR/stellaris_fix.c")
+
+if [ -z "$EXPECTED_TEXT_END" ]; then
+    warn "Could not extract STELLARIS_TEXT_END from stellaris_fix.c — skipping sidecar."
+else
+    mkdir -p "$SIDECAR_DIR"
+    echo "$EXPECTED_TEXT_END" > "$SIDECAR_EXPECTED"
+    ok "Wrote $SIDECAR_EXPECTED ($EXPECTED_TEXT_END)"
+fi
+
+# ── Drift detector (launchd agent) ─────────────────────────────────────────
+
+DRIFT_INSTALLED=0
+if [ -f "$PLIST_TEMPLATE" ] && [ -x "$DRIFT_CHECK" ]; then
+    step "Installing drift detector (launchd agent)"
+
+    mkdir -p "$(dirname "$LAUNCHD_PLIST")"
+
+    # Render template — substitute @REPO_ROOT@ + @GAME_BINARY@. Use sed with
+    # | as delimiter since paths contain /. Escape & in paths defensively.
+    sed_repo=$(printf '%s' "$SCRIPT_DIR" | sed -e 's/[\&|]/\\&/g')
+    sed_bin=$(printf '%s' "$MACOS_DIR/stellaris" | sed -e 's/[\&|]/\\&/g')
+    sed -e "s|@REPO_ROOT@|$sed_repo|g" \
+        -e "s|@GAME_BINARY@|$sed_bin|g" \
+        "$PLIST_TEMPLATE" > "$LAUNCHD_PLIST"
+    ok "Wrote $LAUNCHD_PLIST"
+
+    # Idempotent reload: bootout if already loaded, then bootstrap.
+    # Fall back to legacy load/unload on older macOS where bootout doesn't
+    # know our domain yet.
+    if launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1; then
+        launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null \
+            || launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+    fi
+    if launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST" 2>/dev/null \
+        || launchctl load "$LAUNCHD_PLIST" 2>/dev/null; then
+        ok "launchd agent loaded ($LAUNCHD_LABEL)"
+        DRIFT_INSTALLED=1
+    else
+        warn "launchctl load failed — drift detector won't run automatically."
+        warn "You can still run ./bin/stellaris-fix-doctor manually after game updates."
+    fi
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────
 
 step "Installation complete"
@@ -231,6 +387,18 @@ say ""
 say "  ${GREEN}${BOLD}→${RESET} ${BOLD}Launch Stellaris via Steam${RESET}"
 say "  ${GREEN}${BOLD}→${RESET} ${BOLD}In the Paradox launcher, select ${GREEN}\"Increased Stack Size\"${RESET}"
 say "       from the launch options, then click Play."
+if [ "$COMPANION_INSTALLED" = "1" ]; then
+    say "  ${GREEN}${BOLD}→${RESET} Under ${BOLD}Mods → Browse${RESET}, find ${GREEN}\"Stellaris Mac CTD Fixes (companion)\"${RESET}"
+    say "       and enable it. ${YELLOW}This breaks Steam achievements${RESET} like all other"
+    say "       Stellaris script-level fix mods — disable for ironman runs."
+fi
+say ""
+say ""
+say "${DIM}Health check anytime:${RESET}  ${BOLD}./bin/stellaris-fix-doctor${RESET}"
+if [ "$DRIFT_INSTALLED" = "1" ]; then
+    say "${DIM}Drift detector is active — you'll get a Notification Center alert when${RESET}"
+    say "${DIM}Stellaris updates and the dylib needs rebuilding.${RESET}"
+fi
 say ""
 say "${DIM}To uninstall: run ${RESET}${BOLD}./uninstall.sh${RESET}${DIM} or double-click Uninstall.command${RESET}"
 say "${DIM}For verbose diagnostic logging, set Steam launch options to:${RESET}"

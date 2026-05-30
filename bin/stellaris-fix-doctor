@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""
+stellaris-fix-doctor — health check for the stellaris-mac-fixes CTD package.
+
+Reads the persistent dylib log, the Stellaris crash-bundle directory, and
+the live game binary; prints a one-shot status report covering:
+  - game version vs. dylib's compiled-in __DATA expectation (drift detection)
+  - dylib install presence + version
+  - companion-mod registration
+  - recent session history with per-session recovery counts
+  - crash bundles classified by signature + whether the dylib was loaded
+
+Pure read-only inspection. No side effects.
+
+Usage: stellaris-fix-doctor [--json]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict, Counter
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ── Path discovery ─────────────────────────────────────────────────────────
+
+SCRIPT_PATH = Path(__file__).resolve()
+REPO_ROOT = SCRIPT_PATH.parent.parent  # bin/ → repo root
+HOME = Path.home()
+
+STELLARIS_DIR = Path(os.environ.get(
+    "STELLARIS_DIR",
+    HOME / "Library/Application Support/Steam/steamapps/common/Stellaris",
+))
+PDX_DOCS = HOME / "Documents/Paradox Interactive/Stellaris"
+DYLIB_LOG = PDX_DOCS / "stellaris-fix.log"
+CRASHES_DIR = PDX_DOCS / "crashes"
+COMPANION_POINTER = PDX_DOCS / "mod" / "stellaris-mac-fixes-companion.mod"
+
+SIDECAR_DIR = HOME / ".config/stellaris-mac-fixes"
+SIDECAR_EXPECTED = SIDECAR_DIR / "expected_text_end"
+
+DYLIB_FILE = STELLARIS_DIR / "libstellaris_fix.dylib"
+WRAPPER_FILE = STELLARIS_DIR / "stellaris.app/Contents/MacOS/stellaris_wrapper.sh"
+GAME_BINARY = STELLARIS_DIR / "stellaris.app/Contents/MacOS/stellaris"
+SOURCE_C = REPO_ROOT / "stellaris_fix.c"
+
+# ── Pretty output ──────────────────────────────────────────────────────────
+
+USE_COLOR = sys.stdout.isatty()
+def _c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+def bold(s):   return _c("1", s)
+def green(s):  return _c("32", s)
+def yellow(s): return _c("33", s)
+def red(s):    return _c("31", s)
+def dim(s):    return _c("2", s)
+
+def hdr(s):    print(); print(bold(s))
+def ok(s):     print(f"  {green('✓')} {s}")
+def warn(s):   print(f"  {yellow('!')} {s}")
+def fail(s):   print(f"  {red('✗')} {s}")
+def info(s):   print(f"  {dim(s)}")
+def line(s=""): print(f"  {s}")
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def run(cmd, **kw) -> str:
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, **kw).decode()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+def read_otool_data_vmaddr(binary: Path) -> int | None:
+    """Return the start of the __DATA segment (which equals __TEXT end)."""
+    if not binary.exists():
+        return None
+    out = run(["otool", "-l", str(binary)])
+    if not out:
+        return None
+    in_data = False
+    for ln in out.splitlines():
+        s = ln.strip()
+        if "segname __DATA" in s and "__DATA_CONST" not in s:
+            in_data = True
+            continue
+        if in_data and s.startswith("vmaddr"):
+            try:
+                return int(s.split()[1], 16)
+            except (ValueError, IndexError):
+                return None
+    return None
+
+def read_constant_from_source(name: str) -> str | None:
+    """Grep #define <name> <value> from the source .c file."""
+    if not SOURCE_C.exists():
+        return None
+    pat = re.compile(rf'^#define\s+{re.escape(name)}\s+(\S+)')
+    for ln in SOURCE_C.read_text().splitlines():
+        m = pat.match(ln.strip())
+        if m:
+            return m.group(1).rstrip("UL")  # strip ULL/L suffixes
+    return None
+
+def read_expected_text_end() -> tuple[int | None, str]:
+    """Sidecar first; fall back to grepping the source. Returns (value, source_label)."""
+    if SIDECAR_EXPECTED.exists():
+        try:
+            v = int(SIDECAR_EXPECTED.read_text().strip(), 16)
+            return v, str(SIDECAR_EXPECTED)
+        except ValueError:
+            pass
+    src = read_constant_from_source("STELLARIS_TEXT_END")
+    if src:
+        try:
+            return int(src, 16), str(SOURCE_C)
+        except ValueError:
+            return None, ""
+    return None, ""
+
+def read_dylib_version() -> str | None:
+    raw = read_constant_from_source("STELLARIS_FIX_VERSION")
+    if raw is None:
+        return None
+    return raw.strip().strip('"')
+
+# ── Log parsing ────────────────────────────────────────────────────────────
+
+SESSION_RE = re.compile(
+    r'^=== \[stellaris-fix\] session start v(\S+) pid=(\d+) time=(\S+) ===$'
+)
+# v1.5.0 format: SUMMARY path=X rip=A resume=B sig=H slot=N/32
+# v1.6.0 also emits data-segv variant: SUMMARY path=data-segv rip=A si_addr=Z sig=H op=BB
+# Match both by accepting any whitespace-delimited tail.
+SUMMARY_RE = re.compile(
+    r'^\[stellaris-fix\] SUMMARY path=(\S+)\s+(.*)$'
+)
+KV_RE = re.compile(r'(\w+)=(\S+)')
+
+@dataclass
+class Recovery:
+    path: str       # "a", "b", "chain", or "data-segv"
+    fields: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def rip(self) -> str:    return self.fields.get("rip", "?")
+    @property
+    def sig(self) -> str:    return self.fields.get("sig", "?")
+
+@dataclass
+class Session:
+    version: str
+    pid: int
+    start: datetime
+    recoveries: list[Recovery] = field(default_factory=list)
+
+    @property
+    def counts(self) -> Counter:
+        return Counter(r.path for r in self.recoveries)
+
+def parse_log() -> list[Session]:
+    if not DYLIB_LOG.exists():
+        return []
+    sessions: list[Session] = []
+    cur: Session | None = None
+    for raw in DYLIB_LOG.read_text(errors="replace").splitlines():
+        m = SESSION_RE.match(raw)
+        if m:
+            cur = Session(
+                version=m.group(1),
+                pid=int(m.group(2)),
+                start=datetime.fromisoformat(m.group(3)),
+            )
+            sessions.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = SUMMARY_RE.match(raw)
+        if m:
+            path = m.group(1)
+            fields = dict(KV_RE.findall(m.group(2)))
+            cur.recoveries.append(Recovery(path=path, fields=fields))
+    return sessions
+
+# ── Crash bundle parsing ───────────────────────────────────────────────────
+
+@dataclass
+class Crash:
+    dir_name: str
+    bundle_dir: Path
+    crash_time: datetime | None
+    app_version: str | None
+    top_frames: list[str]
+    rip_zero: bool
+    via_apple_gl: bool
+    dylib_loaded: bool        # was a dylib session active at this time?
+    dylib_recovered: bool     # did that session log a SUMMARY near this timestamp?
+
+CRASH_DIR_RE = re.compile(r'^stellaris_(\d{8})_(\d{6})$')
+
+def parse_meta_yml(path: Path) -> dict:
+    out = {}
+    if not path.exists():
+        return out
+    for ln in path.read_text(errors="replace").splitlines():
+        if ":" in ln and not ln.startswith("#"):
+            k, _, v = ln.partition(":")
+            out[k.strip()] = v.strip().strip('"').rstrip()
+    return out
+
+def parse_exception_txt(path: Path) -> tuple[bool, bool, list[str]]:
+    """Return (rip_zero, via_apple_gl, top_5_stellaris_frames)."""
+    if not path.exists():
+        return False, False, []
+    text = path.read_text(errors="replace")
+    rip_zero = "0x0000000000000000 0x0 + 0" in text
+    via_apple_gl = bool(re.search(r"\b(GLEngine|AppleMetalOpenGLRenderer)\b", text))
+    # Top stellaris frames from "Original Stack Trace"
+    frames = []
+    started = False
+    for ln in text.splitlines():
+        if "Original Stack Trace" in ln:
+            started = True
+            continue
+        if not started:
+            continue
+        m = re.match(r'\s*\d+\s+stellaris\s+\S+\s+(\S+)', ln)
+        if m and len(frames) < 5:
+            frames.append(m.group(1))
+        if "Demangled Stack Trace" in ln:
+            break
+    return rip_zero, via_apple_gl, frames
+
+def match_session(crash_time: datetime, sessions: list[Session]) -> Session | None:
+    """Find the session whose start is closest to (and not after) the crash."""
+    best = None
+    best_delta = timedelta(hours=2)  # don't match if > 2 hours apart
+    for s in sessions:
+        if s.start > crash_time:
+            continue
+        delta = crash_time - s.start
+        if delta < best_delta:
+            best = s
+            best_delta = delta
+    return best
+
+def parse_crashes(sessions: list[Session]) -> list[Crash]:
+    if not CRASHES_DIR.exists():
+        return []
+    crashes = []
+    for entry in sorted(CRASHES_DIR.iterdir(), reverse=True):
+        m = CRASH_DIR_RE.match(entry.name)
+        if not m:
+            continue
+        meta = parse_meta_yml(entry / "meta.yml")
+        # meta.yml DateTime is e.g. "2026-05-01 23:20:47 -0400"
+        crash_time = None
+        dt_str = meta.get("DateTime")
+        if dt_str:
+            try:
+                # Strip the timezone offset for naive comparison
+                dt_str_naive = re.sub(r"\s+[\+\-]\d{4}$", "", dt_str)
+                crash_time = datetime.fromisoformat(dt_str_naive)
+            except ValueError:
+                pass
+        if crash_time is None:
+            # Fall back to dirname timestamp: stellaris_YYYYMMDD_HHMMSS
+            try:
+                crash_time = datetime.strptime(
+                    entry.name, "stellaris_%Y%m%d_%H%M%S"
+                )
+            except ValueError:
+                continue
+        rip_zero, via_apple_gl, frames = parse_exception_txt(entry / "exception.txt")
+        sess = match_session(crash_time, sessions)
+        dylib_loaded = sess is not None
+        # Was a SUMMARY logged near this crash time?
+        dylib_recovered = False
+        if sess:
+            for r in sess.recoveries:
+                if r.path in ("a", "b"):
+                    dylib_recovered = True
+                    break
+        crashes.append(Crash(
+            dir_name=entry.name,
+            bundle_dir=entry,
+            crash_time=crash_time,
+            app_version=meta.get("AppVersion") or None,
+            top_frames=frames,
+            rip_zero=rip_zero,
+            via_apple_gl=via_apple_gl,
+            dylib_loaded=dylib_loaded,
+            dylib_recovered=dylib_recovered,
+        ))
+    return crashes
+
+def signature_for(crash: Crash) -> str:
+    """Cheap human-readable signature based on the top frames + crash flavor."""
+    if crash.rip_zero and crash.via_apple_gl:
+        return "null-call-via-AppleGL"
+    if crash.rip_zero:
+        return "null-call-stellaris-direct"
+    if crash.top_frames:
+        return f"stellaris-{crash.top_frames[0][2:10]}"  # first frame addr suffix
+    return "unknown"
+
+# ── Reporting ──────────────────────────────────────────────────────────────
+
+def fmt_addr(v: int | None) -> str:
+    return f"0x{v:x}" if v is not None else "?"
+
+def report_text(data: dict) -> None:
+    print()
+    print(bold("Stellaris Mac CTD Package — Health Check"))
+    print(dim("─" * 42))
+
+    hdr("Game + dylib alignment")
+    g = data["game"]
+    d = data["dylib"]
+    if g["binary_present"]:
+        line(f"Game binary:        {green('found')}  ({fmt_addr(g['data_vmaddr'])} __DATA)")
+    else:
+        warn(f"Game binary not found at {GAME_BINARY}")
+    if d["expected_text_end"] is not None:
+        line(f"Dylib expects:      {fmt_addr(d['expected_text_end'])}  ({dim(d['expected_source'])})")
+    if g["data_vmaddr"] is not None and d["expected_text_end"] is not None:
+        if g["data_vmaddr"] == d["expected_text_end"]:
+            ok("Game version matches dylib expectation — no drift")
+        else:
+            warn(red(f"DRIFT: game __DATA={fmt_addr(g['data_vmaddr'])}, dylib expects {fmt_addr(d['expected_text_end'])}"))
+            warn("Rebuild the dylib: cd into the repo, edit STELLARIS_TEXT_END in stellaris_fix.c, then `make && ./install.sh`")
+
+    hdr("Install state")
+    if d["installed"]:
+        ok(f"Dylib installed at {DYLIB_FILE}")
+    else:
+        fail(f"Dylib NOT installed at {DYLIB_FILE} — run ./install.sh")
+    if d["wrapper_installed"]:
+        ok("Launcher wrapper script installed")
+    else:
+        warn("Launcher wrapper script missing — dylib won't load via launcher")
+    if data["companion_mod"]["registered"]:
+        ok(f"Companion mod registered → {data['companion_mod']['path']}")
+    else:
+        warn("Companion mod NOT registered (Mods → Browse won't show it)")
+    line(f"Source repo:        {dim(str(REPO_ROOT))}")
+    if d["version"]:
+        line(f"Dylib version:      {d['version']} {dim('(from stellaris_fix.c)')}")
+
+    hdr("Recent sessions")
+    sessions = data["sessions"]
+    if not sessions:
+        warn("No dylib sessions recorded yet — dylib may have never loaded")
+    else:
+        for s in sessions[-5:][::-1]:
+            counts = s["counts"]
+            recovered = counts.get("a", 0) + counts.get("b", 0) + counts.get("data-recovered", 0)
+            chain_n = counts.get("chain", 0)
+            data_n = counts.get("data-segv", 0)
+            tags = []
+            if recovered:
+                detail = []
+                if counts.get("a", 0):              detail.append(f"{counts['a']} path-a")
+                if counts.get("b", 0):              detail.append(f"{counts['b']} path-b")
+                if counts.get("data-recovered", 0): detail.append(f"{counts['data-recovered']} data-recovered")
+                tags.append(green(f"{recovered} recovered ({', '.join(detail)})"))
+            if chain_n:
+                tags.append(yellow(f"{chain_n} bad-RIP not recovered"))
+            if data_n:
+                tags.append(dim(f"{data_n} data-segv unrecovered"))
+            tag = "  → " + ", ".join(tags) if tags else ""
+            line(f"{s['start']}  v{s['version']}  pid={s['pid']:<6}{tag}")
+
+    hdr("Crashes (most recent 10)")
+    crashes = data["crashes"]
+    if not crashes:
+        ok("No crash bundles recorded — clean slate")
+    else:
+        unrecovered = 0
+        sig_counts: Counter = Counter()
+        for c in crashes[:10]:
+            sig = c["signature"]
+            sig_counts[sig] += 1
+            tag = ""
+            if c["dylib_loaded"] and c["dylib_recovered"]:
+                tag = green("recovered")
+            elif c["dylib_loaded"]:
+                tag = yellow("dylib loaded but didn't recover")
+                unrecovered += 1
+            else:
+                tag = red("DYLIB DID NOT LOAD")
+                unrecovered += 1
+            ts = c["crash_time"][:19] if c["crash_time"] else "?"
+            line(f"{ts}  v{c['app_version'] or '?':<6}  sig={sig:<28}  → {tag}")
+        if sig_counts:
+            print()
+            line(dim("Signature frequency:"))
+            for sig, n in sig_counts.most_common():
+                line(f"  {sig:<32}  {n}×")
+
+    hdr("Recommendations")
+    recs = data["recommendations"]
+    if not recs:
+        ok("No issues found.")
+    else:
+        for kind, msg in recs:
+            (ok if kind == "ok" else warn if kind == "warn" else fail)(msg)
+    print()
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def collect() -> dict:
+    sessions = parse_log()
+    expected, expected_src = read_expected_text_end()
+    data_vmaddr = read_otool_data_vmaddr(GAME_BINARY)
+    crashes = parse_crashes(sessions)
+    crash_dicts = []
+    for c in crashes:
+        crash_dicts.append({
+            "dir_name": c.dir_name,
+            "crash_time": c.crash_time.isoformat() if c.crash_time else None,
+            "app_version": c.app_version,
+            "top_frames": c.top_frames,
+            "rip_zero": c.rip_zero,
+            "via_apple_gl": c.via_apple_gl,
+            "dylib_loaded": c.dylib_loaded,
+            "dylib_recovered": c.dylib_recovered,
+            "signature": signature_for(c),
+        })
+    data = {
+        "game": {
+            "binary_present": GAME_BINARY.exists(),
+            "data_vmaddr": data_vmaddr,
+        },
+        "dylib": {
+            "installed": DYLIB_FILE.exists(),
+            "wrapper_installed": WRAPPER_FILE.exists(),
+            "version": read_dylib_version(),
+            "expected_text_end": expected,
+            "expected_source": expected_src,
+        },
+        "companion_mod": {
+            "registered": COMPANION_POINTER.exists(),
+            "path": str(COMPANION_POINTER),
+        },
+        "sessions": [
+            {
+                "version": s.version,
+                "pid": s.pid,
+                "start": s.start.isoformat(timespec="seconds").replace("T", " "),
+                "counts": dict(s.counts),
+            }
+            for s in sessions
+        ],
+        "crashes": crash_dicts,
+        "recommendations": [],
+    }
+    # Recommendations
+    recs = data["recommendations"]
+    if expected is not None and data_vmaddr is not None and expected != data_vmaddr:
+        recs.append(("fail", f"Game binary drifted: game __DATA={fmt_addr(data_vmaddr)} vs dylib expects {fmt_addr(expected)}. Rebuild and reinstall the dylib."))
+    elif expected is not None and data_vmaddr == expected:
+        recs.append(("ok", "Game version matches dylib's compiled-in expectation."))
+    if not DYLIB_FILE.exists():
+        recs.append(("fail", "Dylib not installed — run ./install.sh"))
+    if not WRAPPER_FILE.exists():
+        recs.append(("warn", "Launcher wrapper missing — re-run ./install.sh"))
+    if not COMPANION_POINTER.exists():
+        recs.append(("warn", "Companion mod not registered — re-run ./install.sh (or delete companion-mod/ to opt out)"))
+    # Sessions where game crashed without dylib loaded
+    no_load_crashes = [c for c in crash_dicts if not c["dylib_loaded"]]
+    if no_load_crashes:
+        recs.append(("warn", f"{len(no_load_crashes)} recent crash(es) happened without the dylib loaded — verify you launch via the 'Increased Stack Size' launcher entry."))
+    return data
+
+def main():
+    ap = argparse.ArgumentParser(description="Health check for stellaris-mac-fixes")
+    ap.add_argument("--json", action="store_true", help="Output JSON instead of text")
+    ap.add_argument("--check-drift", action="store_true",
+                    help="Exit 0 if no drift, 1 if game binary drifted from dylib expectation. Used by drift-detector launchd job.")
+    args = ap.parse_args()
+
+    data = collect()
+
+    if args.check_drift:
+        g = data["game"]["data_vmaddr"]
+        e = data["dylib"]["expected_text_end"]
+        if g is None or e is None or g == e:
+            sys.exit(0)
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        report_text(data)
+
+if __name__ == "__main__":
+    main()

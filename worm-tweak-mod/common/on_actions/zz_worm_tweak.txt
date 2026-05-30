@@ -1,0 +1,8 @@
+# Additive merge with vanilla on_game_start_country.
+# Fires the worm_tweak.0 trampoline, which schedules the configuration popup
+# for day 1 (see events/worm_tweak_events.txt).
+on_game_start_country = {
+	events = {
+		worm_tweak.0
+	}
+}

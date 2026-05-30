@@ -1,0 +1,153 @@
+# Dead-war cleanup + AI Shroud engagement.
+#
+# Source: ~~Stellaris [v4.3] General Fixes — events/base_fixes.txt:3-29 (AI
+#         Shroud, base_fix.2), :71-165 (dead war, base_fix.5/6/7), and the
+#         on_actions in common/on_actions/base_fix_on_actions.txt.
+#
+# Failure modes addressed:
+#   - Wars where the leader has < 500 fleet power and 0 controlled planets
+#     can stall indefinitely; AI never accepts surrender, neither side can
+#     win. Periodic detector + war-exhaustion application terminates them.
+#   - AI empires with Shroud access never re-engage after their first delve
+#     because of a stale shroud_diplomacy_engaged flag interaction. Yearly
+#     pulse re-engages eligible AI when conditions are met.
+
+namespace = smf
+
+# Save-load: kick off the dead-war check immediately on resumed games
+event = {
+	id = smf.50
+	hide_window = yes
+	is_triggered_only = yes
+
+	immediate = {
+		event = { id = smf.51 days = 1 }
+	}
+}
+
+# Yearly: detect stalled wars
+event = {
+	id = smf.51
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		any_playable_country = {
+			is_at_war = yes
+			is_war_leader = yes
+			NOR = {
+				fleet_power >= 500
+				any_controlled_planet = {  }
+			}
+		}
+	}
+
+	immediate = {
+		random_playable_country = {
+			limit = {
+				is_at_war = yes
+				is_war_leader = yes
+				NOR = {
+					fleet_power >= 500
+					any_controlled_planet = {  }
+				}
+			}
+			country_event = { id = smf.53 days = 1 }
+		}
+	}
+}
+
+# Apply war-exhaustion to opponent (split out so we can re-trigger via .52
+# on planet-occupied events without duplicating logic)
+country_event = {
+	id = smf.53
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		is_at_war = yes
+		is_war_leader = yes
+		NOR = {
+			fleet_power >= 500
+			any_controlled_planet = {  }
+		}
+	}
+
+	immediate = {
+		random_war = {
+			limit = { prev = { is_war_leader = yes } }
+			random_war_participant = {
+				limit = {
+					is_war_leader = yes
+					NOT = { is_same_empire = prevprev }
+				}
+				save_event_target_as = smf_war_opponent
+			}
+		}
+		add_static_war_exhaustion = {
+			attacker = event_target:smf_war_opponent
+			location = capital_scope
+			value_for_planet_destruction = 1
+		}
+	}
+}
+
+# On planet occupied: if the planet's owner is now in the dead-war state,
+# trigger the cleanup
+planet_event = {
+	id = smf.52
+	hide_window = yes
+	is_triggered_only = yes
+
+	pre_triggers = {
+		has_owner = yes
+		is_ai = yes
+	}
+
+	trigger = {
+		from = {
+			is_at_war = yes
+			is_war_leader = yes
+			NOR = {
+				fleet_power >= 500
+				any_controlled_planet = {  }
+			}
+		}
+	}
+
+	immediate = {
+		from = {
+			country_event = { id = smf.53 days = 1 }
+		}
+	}
+}
+
+# AI Shroud engagement (yearly).
+# Forces eligible AI empires with breached/fallen Shroud to attempt the delve
+# diplomacy event when conditions are right (>= 5000 energy, no active cooldown).
+event = {
+	id = smf.60
+	hide_window = yes
+	is_triggered_only = yes
+
+	immediate = {
+		random_playable_country = {
+			limit = {
+				is_ai = yes
+				is_country_type_with_subjects = yes
+				OR = {
+					has_country_flag = breached_shroud
+					has_country_flag = shroud_fallen_empire
+				}
+				NOR = {
+					resource_stockpile_compare = { resource = energy value < 5000 }
+					has_country_flag = shroud_diplomacy_engaged
+					has_modifier = shroud_cooldown
+					has_modifier = shroud_precog_cooldown
+				}
+			}
+			add_resource = { energy = -1000 }
+			country_event = { id = utopia.3002 days = 10 }
+		}
+	}
+}

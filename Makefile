@@ -20,7 +20,7 @@ RELEASE_FILES = \
 	README.md \
 	LICENSE
 
-.PHONY: all clean test install uninstall checksums release help
+.PHONY: all clean test test_decoder install uninstall checksums release help
 
 help:
 	@echo "Targets:"
@@ -40,10 +40,17 @@ $(TARGET): stellaris_fix.c
 clean:
 	rm -f $(TARGET) test_interpose $(CHECKSUMS_FILE) $(RELEASE_CHECKSUMS_FILE) $(RELEASE_ZIP)
 
-test: $(TARGET) test_interpose.c
+test: $(TARGET) test_interpose.c test_decoder
 	$(CC) -arch x86_64 $(CFLAGS) -Wno-unused-result -o test_interpose test_interpose.c
 	DYLD_INSERT_LIBRARIES=./$(TARGET) STELLARIS_FIX_DEBUG=1 ./test_interpose
 	@rm -f test_interpose
+
+# Standalone decoder test (no dylib link; exercises the load-instruction
+# pattern matcher used by Fix 4 against known-good byte sequences).
+test_decoder: test_decoder.c
+	$(CC) -O0 -arch x86_64 $(CFLAGS) -o test_decoder test_decoder.c
+	./test_decoder
+	@rm -f test_decoder
 
 install: $(TARGET)
 	./install.sh

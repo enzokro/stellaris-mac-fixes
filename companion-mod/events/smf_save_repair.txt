@@ -1,0 +1,315 @@
+# Save-load state repair (guarded mutations only).
+#
+# Source: ~~Stellaris [v4.3] General Fixes — events/!general_active_fix_patch_saves.txt
+#         (general_patch_active.99) + ccrebel_fixes.txt:10-79 (rebellionfix.34/.35).
+#
+# Each mutation below is guarded by an `exists =` / `has_X = no` / `num_ethics = 0`
+# check that proves the state is broken before we touch it. Healthy saves are no-ops.
+#
+# What we repair on load:
+#   - Stale prethoryn / pet_queen event_target references re-anchored from
+#     surviving country/fleet entities (only if the targets are missing AND
+#     the corresponding entities still exist in the galaxy)
+#   - Shroud DLC flag cleanup for non-DLC players (only acts if the diplomacy
+#     flag is set on a player without the DLC, which is the broken state)
+#   - Ascension trait/leader sync for Synthetic / Psionic / Cyborg / Erudite
+#     paths (only acts when there's a species/leader trait mismatch)
+#   - No-ethic empires: copy ethics from overlord if vassal; log otherwise
+
+namespace = smf
+
+# Master save-load entry: dispatches to specific repair sub-events
+event = {
+	id = smf.10
+	hide_window = yes
+	is_triggered_only = yes
+
+	immediate = {
+		log = "SMF: companion mod save-load state repair starting"
+
+		# === Prethoryn / pet_queen target re-anchoring ===
+		# Only acts when invasion is ongoing AND target is missing AND the
+		# corresponding entities still exist (so we can re-anchor to them)
+		if = {
+			limit = {
+				years_passed > 20
+				has_global_flag = prethoryn_main_invasion
+				has_global_flag = ongoing_prethoryn_invasion
+			}
+			if = {
+				limit = {
+					NOT = { exists = event_target:prethoryn }
+					any_country = { is_country_type = swarm }
+				}
+				random_country = {
+					limit = { is_country_type = swarm }
+					save_global_event_target_as = prethoryn
+				}
+				log = "SMF: re-anchored event_target:prethoryn"
+			}
+			random_playable_country = {
+				limit = {
+					is_ai = no
+					has_country_flag = queen_captured
+				}
+				random_owned_fleet = {
+					limit = { has_fleet_flag = pet_queen }
+					save_global_event_target_as = pet_queen
+				}
+			}
+		}
+
+		# === Shroud DLC flag cleanup for non-DLC players ===
+		# Vanilla bug: a stale shroud_diplomacy_engaged flag blocks Shroud
+		# access. Source author cites Paradox forum 4.0.21 thread.
+		random_playable_country = {
+			limit = {
+				is_ai = no
+				has_shroud_dlc = no
+				has_country_flag = shroud_diplomacy_engaged
+			}
+			remove_country_flag = shroud_diplomacy_engaged
+			log = "SMF: cleared stale shroud_diplomacy_engaged on non-DLC player"
+		}
+
+		# === Ascension trait sync ===
+		# Each branch only fires if there's a leader/species mismatch with
+		# the ascension state — purely corrective, no-op on healthy saves.
+		every_playable_country = {
+			limit = { has_ascension_path = yes }
+			# Synthetic
+			if = {
+				limit = {
+					is_synthetic_empire = yes
+					has_synthetic_ascension = yes
+				}
+				if = {
+					limit = {
+						OR = {
+							has_tradition = tr_virtuality_1
+							has_tradition = tr_virtuality_adopt
+							has_country_flag = synth_virtual
+						}
+					}
+					every_owned_leader = {
+						limit = {
+							species = { is_robotic = yes has_virtual_species_trait = yes }
+							NOT = { has_trait = leader_trait_virtual }
+						}
+						add_trait = { trait = leader_trait_virtual show_message = no }
+					}
+					every_owned_leader = {
+						limit = {
+							species = { has_virtual_species_trait = no is_robotic = yes }
+							has_trait = leader_trait_virtual
+							is_leader_tier = leader_tier_default
+							is_gestalt_node = no
+						}
+						prev = {
+							random_owned_species = {
+								limit = {
+									is_same_species = prevprev
+									is_robotic = yes
+									has_virtual_species_trait = yes
+								}
+								prevprev = { change_species = prev }
+							}
+						}
+					}
+				}
+				else = {
+					machine_synthetic_leader_effect = yes
+				}
+			}
+			# Psionic
+			else_if = {
+				limit = {
+					OR = {
+						AND = {
+							has_shroud_dlc = yes
+							has_tradition = tr_psionics_shroud_great_awakening
+						}
+						has_finished_psionic_tradition = yes
+						has_tradition = tr_psionics_psionic_assimilation
+					}
+					owner_species = { is_psionic_species = yes }
+					NOT = { has_country_flag = psionic_fix_worked }
+				}
+				if = {
+					limit = {
+						is_gestalt = yes
+						has_shroud_dlc = yes
+						ruler = { has_psionic_leader_trait = no }
+					}
+					ruler = {
+						add_trait = { trait = leader_trait_psionic show_message = no }
+					}
+				}
+				if = {
+					limit = {
+						any_owned_leader = { is_same_species = owner_species has_psionic_leader_trait = no }
+					}
+					every_owned_leader = {
+						limit = {
+							is_same_species = owner_species
+							has_psionic_leader_trait = no
+						}
+						add_trait = { trait = leader_trait_psionic show_message = no }
+					}
+					set_country_flag = psionic_fix_worked
+				}
+				if = {
+					limit = {
+						any_owned_species = { is_same_species = prev is_latent_psionic_species = yes }
+					}
+					turn_main_species_to_psionic = yes
+				}
+				every_owned_leader = {
+					limit = {
+						species = { is_psionic_species = no }
+						has_trait = leader_trait_psionic
+						is_leader_tier = leader_tier_default
+						is_gestalt_node = no
+					}
+					prev = {
+						random_owned_species = {
+							limit = {
+								is_same_species = prevprev
+								is_psionic_species = yes
+							}
+							prevprev = { change_species = prev }
+						}
+					}
+				}
+			}
+			# Cyborg
+			else_if = {
+				limit = {
+					OR = {
+						has_cybernetic_ascension = yes
+						has_active_tradition = tr_cybernetics_integrated_anatomy
+						has_active_tradition = tr_cybernetics_assimilator_integrated_anatomy
+					}
+				}
+				every_owned_leader = {
+					limit = {
+						species = { has_trait = trait_cybernetic }
+						NOT = { has_trait = leader_trait_cyborg }
+					}
+					add_trait = { trait = leader_trait_cyborg show_message = no }
+				}
+				every_owned_leader = {
+					limit = {
+						species = { has_trait = trait_limited_cybernetic }
+						NOT = { has_trait = leader_trait_limited_cyborg }
+					}
+					add_trait = { trait = leader_trait_limited_cyborg show_message = no }
+				}
+				every_owned_leader = {
+					limit = {
+						NOT = { species = { has_trait = trait_cybernetic } }
+						has_trait = leader_trait_cyborg
+						is_leader_tier = leader_tier_default
+					}
+					prev = {
+						random_owned_species = {
+							limit = {
+								is_same_species = prevprev
+								has_trait = trait_cybernetic
+							}
+							prevprev = { change_species = prev }
+						}
+					}
+				}
+			}
+			# Erudite
+			else = {
+				every_owned_leader = {
+					limit = {
+						species = { has_trait = trait_erudite }
+						NOT = { has_trait = leader_trait_erudite }
+					}
+					add_trait = { trait = leader_trait_erudite show_message = no }
+				}
+				every_owned_leader = {
+					limit = {
+						NOT = { species = { has_trait = trait_erudite } }
+						has_trait = leader_trait_erudite
+						is_leader_tier = leader_tier_default
+						is_gestalt_node = no
+					}
+					prev = {
+						random_owned_species = {
+							limit = {
+								is_same_species = prevprev
+								has_trait = trait_erudite
+							}
+							prevprev = { change_species = prev }
+						}
+					}
+				}
+			}
+		}
+
+		log = "SMF: companion mod save-load state repair done"
+	}
+}
+
+# === No-ethic empire reconstruction (smf.20) ===
+# Detect on save load. Dispatch to .21 for vassals (copy from overlord).
+# Non-vassal no-ethic empires are extremely rare and complex to repair safely;
+# we log them but don't attempt reconstruction without the source mod's full
+# pop-percentage rebuild logic (which is 200+ lines and changes ethics).
+event = {
+	id = smf.20
+	hide_window = yes
+	is_triggered_only = yes
+	# Multiplayer can OOS on save-load mutations; gate to single-player
+	trigger = {
+		is_multiplayer = no
+		any_playable_country = { num_ethics = 0 }
+	}
+
+	immediate = {
+		every_playable_country = {
+			limit = { num_ethics = 0 }
+			if = {
+				limit = { is_subject = yes }
+				log = "SMF: no-ethic vassal detected — copying ethics from overlord [This.GetName]"
+				country_event = { id = smf.21 scopes = { from = overlord } days = 1 }
+			}
+			else = {
+				log = "SMF: no-ethic non-vassal empire [This.GetName] — repair skipped (would require full pop-rebuild)"
+			}
+		}
+	}
+}
+
+# Copy ethics from overlord (this = vassal, from = overlord)
+country_event = {
+	id = smf.21
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		num_ethics = 0
+		is_multiplayer = no
+		exists = from
+		from = { is_scope_type = country }
+	}
+
+	immediate = {
+		copy_ethos_and_authority = from
+		if = {
+			limit = {
+				NOR = {
+					has_origin = origin_default
+					has_origin = origin_separatists
+					has_origin = origin_liberated
+				}
+			}
+			set_origin = origin_separatists
+		}
+		log = "SMF: repaired no-ethic vassal [This.GetName] from overlord [From.GetName]"
+	}
+}

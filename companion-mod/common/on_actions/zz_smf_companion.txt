@@ -1,0 +1,88 @@
+# Additive on_actions hooks for the stellaris-mac-fixes companion mod.
+# Stellaris merges on_actions files additively; the zz_ prefix sorts late
+# so our hooks append to (not replace) anything else mods/vanilla register.
+
+on_single_player_save_game_load = {
+	events = {
+		smf.10        # Save-load state repair (guarded mutations)
+		smf.20        # No-ethic empire reconstruction
+		smf.30        # Cybernetic Creed leader-trait sync (Machine Age DLC)
+		smf.31        # Cyberization situation deadlock recovery
+		smf.40        # Titanic army counter resync
+		smf.50        # Dead-war cleanup
+	}
+}
+
+on_yearly_pulse = {
+	events = {
+		smf.51        # Dead-war detector
+		smf.60        # AI Shroud engagement
+	}
+}
+
+on_bi_yearly_pulse = {
+	events = {
+		smf.40        # Titanic army counter resync (defensive double-check)
+	}
+}
+
+on_planet_transfer = {
+	events = {
+		smf.1         # AI hive→non-hive planet-transfer null guard
+		smf.41        # Titanic army counter on planet transfer
+	}
+}
+
+on_planet_occupied = {
+	events = {
+		smf.52        # War-exhaustion check on occupation
+	}
+}
+
+on_colonized = {
+	events = {
+		smf.42        # Titanic army counter on colonization
+	}
+}
+
+on_colony_destroyed = {
+	events = {
+		smf.43        # Titanic army counter on colony destruction
+	}
+}
+
+on_army_recruited = {
+	events = {
+		smf.44        # Titanic army cap-overflow check + refund
+	}
+}
+
+on_army_killed_in_combat = {
+	events = {
+		smf.45        # Titanic army counter decrement on combat death
+	}
+}
+
+on_army_killed_no_combat = {
+	events = {
+		smf.45        # Titanic army counter decrement on non-combat death
+	}
+}
+
+on_army_disbanded = {
+	events = {
+		smf.46        # Titanic army counter decrement on disband
+	}
+}
+
+on_ship_disbanded = {
+	events = {
+		smf.47        # Titanic army counter decrement on transport disband
+	}
+}
+
+on_starbase_transfer = {
+	events = {
+		anomaly.16001  # Nanite swarm anomaly re-enable on starbase transfer
+	}
+}

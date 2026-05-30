@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""
+stellaris-fix-save-doctor — inspect a Stellaris save file for state corruption.
+
+A Stellaris .sav is a zip archive with two members: `meta` (small header)
+and `gamestate` (the world state, often 50-200 MB uncompressed). Both are
+in Paradox's clausewitz-script-like text format — nested key=value blocks
+delimited by braces.
+
+This v0.1 reads the save, prints a structured introspection report
+(version, date, country/leader/fleet counts), and runs two validators:
+
+  V1: zero-ethic empires — country blocks whose `ethos={}` array is empty.
+      This is the rebellionfix.34 case from the General Fixes mod, but
+      detected offline before you load the save. A zero-ethic empire is
+      a save-corruption signal that often crashes the game at load.
+
+  V2: dangling country event_targets — `saved_event_target={ type=country
+      id=N name="X" }` blocks where N doesn't appear in the country pool.
+      The script-engine deref of a dead country target is a major crash
+      class (the smf_save_repair.txt and several DLC fixes target it from
+      the inside; this validator detects it from the outside).
+
+Read-only in v0.1 — no repair, no .sav writes. Repair lands in a follow-up
+once we've validated the inspection logic against several real saves.
+
+Ironman saves use a binary-encoded gamestate that this tool does not
+support; we detect and decline.
+
+Usage: stellaris-fix-save-doctor [--json] SAVE.sav
+"""
+
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import re
+import sys
+import zipfile
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+
+# ── Pretty output ──────────────────────────────────────────────────────────
+
+USE_COLOR = sys.stdout.isatty()
+def _c(code: str, s: str) -> str:
+    return f"\033[{code}m{s}\033[0m" if USE_COLOR else s
+def bold(s):   return _c("1", s)
+def green(s):  return _c("32", s)
+def yellow(s): return _c("33", s)
+def red(s):    return _c("31", s)
+def dim(s):    return _c("2", s)
+
+def hdr(s):    print(); print(bold(s))
+def ok(s):     print(f"  {green('✓')} {s}")
+def warn(s):   print(f"  {yellow('!')} {s}")
+def fail(s):   print(f"  {red('✗')} {s}")
+def line(s=""): print(f"  {s}")
+
+# ── Save file IO ───────────────────────────────────────────────────────────
+
+@dataclass
+class Save:
+    path: Path
+    meta_text: str
+    gamestate_text: str
+    is_ironman: bool        # True if gamestate appears binary-encoded
+
+def read_save(path: Path) -> Save:
+    with zipfile.ZipFile(path, "r") as z:
+        names = z.namelist()
+        if "meta" not in names or "gamestate" not in names:
+            raise SystemExit(
+                f"Not a Stellaris save (missing meta/gamestate inside zip): {path}"
+            )
+        meta = z.read("meta")
+        gamestate = z.read("gamestate")
+    # Ironman binary-encoded saves start with the magic bytes "EU4bin" (yes,
+    # really, even in Stellaris — Paradox's PDX_text/PDX_binary container is
+    # shared) or use a different non-text leading byte. Cheap detection:
+    # ironman text doesn't survive UTF-8 decode AND has a high ratio of
+    # control bytes. We'll just try-decode and bail if it's clearly binary.
+    is_ironman = False
+    try:
+        gs_text = gamestate.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        is_ironman = True
+        gs_text = ""
+    try:
+        meta_text = meta.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        # If meta is binary too, definitely ironman / unsupported
+        is_ironman = True
+        meta_text = ""
+    return Save(path=path, meta_text=meta_text, gamestate_text=gs_text, is_ironman=is_ironman)
+
+# ── Block scanner (brace-depth aware) ──────────────────────────────────────
+
+def find_toplevel_block(lines: list[str], key: str) -> tuple[int, int] | None:
+    """Return (start_line, end_line_exclusive) of `key={ ... }` at top level."""
+    in_block = False
+    depth = 0
+    start = None
+    for i, raw in enumerate(lines):
+        s = raw.rstrip()
+        if not in_block:
+            if s == f"{key}={{":
+                in_block = True
+                depth = 1
+                start = i + 1
+        else:
+            depth += s.count("{") - s.count("}")
+            if depth == 0:
+                return (start, i)
+    return None
+
+# Top-level country block contains entries like `\tNNN={`
+COUNTRY_HEADER_RE = re.compile(r'^\t(\d+)=\{$')
+
+def iter_country_blocks(lines: list[str]) -> list[tuple[int, int, int]]:
+    """Return list of (country_id, body_start_line, body_end_line_exclusive)."""
+    rng = find_toplevel_block(lines, "country")
+    if rng is None:
+        return []
+    out = []
+    cstart, cend = rng
+    depth = 0
+    cur_id = None
+    cur_body = None
+    for i in range(cstart, cend):
+        s = lines[i].rstrip()
+        if depth == 0:
+            m = COUNTRY_HEADER_RE.match(s)
+            if m:
+                cur_id = int(m.group(1))
+                depth = 1
+                cur_body = i + 1
+                continue
+        else:
+            depth += s.count("{") - s.count("}")
+            if depth == 0:
+                if cur_id is not None and cur_body is not None:
+                    out.append((cur_id, cur_body, i))
+                cur_id = None
+                cur_body = None
+    return out
+
+# ── Validators ─────────────────────────────────────────────────────────────
+
+ETHIC_LINE_RE = re.compile(r'^\s*ethic\s*=')
+ETHOS_OPEN_RE = re.compile(r'^\s*ethos=\{')
+ETHOS_CLOSE_RE = re.compile(r'^\s*\}')
+
+# Match `name=...` at the start of a country body (one tab in)
+COUNTRY_NAME_RE = re.compile(r'^\t\tname="([^"]*)"')
+
+@dataclass
+class Issue:
+    kind: str
+    severity: str           # "error" | "warn" | "info"
+    summary: str
+    details: dict = field(default_factory=dict)
+    # Repair metadata — None if not auto-repairable in this version.
+    # `repair_kind` selects the repair function. `repair_target` is the
+    # repair-specific locator (line range, byte offset, country id, etc.).
+    repair_kind: str | None = None
+    repair_target: dict = field(default_factory=dict)
+
+def country_name(lines: list[str], body_start: int, body_end: int) -> str | None:
+    # Scan the first ~20 lines of the country body for a top-level name
+    for i in range(body_start, min(body_start + 30, body_end)):
+        m = COUNTRY_NAME_RE.match(lines[i])
+        if m:
+            return m.group(1)
+    return None
+
+def validate_zero_ethic_empires(
+    lines: list[str], country_blocks: list[tuple[int, int, int]]
+) -> list[Issue]:
+    issues = []
+    for cid, bstart, bend in country_blocks:
+        # Find the country's top-level ethos={...} block (depth 2 in gamestate).
+        depth = 0
+        in_ethos = False
+        ethos_depth = None
+        ethic_count = 0
+        ethos_seen = False
+        ethos_open_line = None      # 0-indexed line number of `ethos={`
+        ethos_close_line = None     # 0-indexed line number of the matching `}`
+        for i in range(bstart, bend):
+            s = lines[i].rstrip()
+            if not in_ethos:
+                if depth == 0 and ETHOS_OPEN_RE.match(s):
+                    in_ethos = True
+                    ethos_seen = True
+                    ethic_count = 0
+                    ethos_open_line = i
+                    if s.endswith("}"):
+                        ethos_close_line = i
+                        in_ethos = False
+                        depth = 0
+                        continue
+                    ethos_depth = 1
+                else:
+                    depth += s.count("{") - s.count("}")
+            else:
+                if ETHIC_LINE_RE.match(s):
+                    ethic_count += 1
+                ethos_depth += s.count("{") - s.count("}")
+                if ethos_depth <= 0:
+                    ethos_close_line = i
+                    in_ethos = False
+                    ethos_depth = None
+        if ethos_seen and ethic_count == 0:
+            name = country_name(lines, bstart, bend) or f"<unnamed #{cid}>"
+            issues.append(Issue(
+                kind="zero_ethic_empire",
+                severity="error",
+                summary=f"Country #{cid} ({name}) has empty ethos={{}}",
+                details={"country_id": cid, "name": name},
+                repair_kind="inject_default_ethic",
+                repair_target={
+                    "country_id": cid,
+                    "ethos_open_line": ethos_open_line,
+                    "ethos_close_line": ethos_close_line,
+                },
+            ))
+    return issues
+
+# saved_event_target={ type=country id=N name="..." }
+SAVED_TARGET_BLOCK_RE = re.compile(
+    r'saved_event_target=\{\s*'
+    r'type=([a-z_]+)\s*'
+    r'id=(\d+)\s*'
+    r'(?:name="([^"]*)"\s*)?'
+    r'\}',
+    re.MULTILINE,
+)
+
+def validate_dangling_country_targets(
+    text: str, country_ids: set[int]
+) -> list[Issue]:
+    """Find saved_event_target entries pointing to country IDs not in the
+    live country pool. Stellaris uses 32-bit IDs with the high byte as a
+    "version" counter: when a country slot is destroyed and reused, the
+    version increments, so an old saved_event_target referencing the prior
+    version becomes stale. The engine usually handles these via null guards
+    (the General Fixes mod's smf_save_repair.txt re-anchors them), so most
+    dangling targets are benign — we report them as info-level. The
+    error-severity validator is V1 (zero-ethic empires) which is genuinely
+    crash-causing."""
+    issues = []
+    seen = set()
+    for m in SAVED_TARGET_BLOCK_RE.finditer(text):
+        type_, id_str, name = m.group(1), m.group(2), m.group(3) or ""
+        if type_ != "country":
+            continue
+        cid = int(id_str)
+        if cid in country_ids:
+            continue
+        key = (cid, name)
+        if key in seen:
+            continue
+        seen.add(key)
+        version_byte = (cid >> 24) & 0xff
+        slot = cid & 0x00ffffff
+        flavor = "destroyed-version-marker" if version_byte else "destroyed-slot-stale-ref"
+        issues.append(Issue(
+            kind="dangling_country_target",
+            severity="info",
+            summary=f'saved_event_target name="{name or "?"}" → country #{cid} ({flavor}, slot={slot} v={version_byte})',
+            details={"country_id": cid, "name": name, "slot": slot, "version": version_byte, "flavor": flavor},
+            # We do NOT repair these in v0.2:
+            #  - destroyed-version-marker variants are handled by the engine
+            #  - destroyed-slot-stale-ref removal would require finding ALL
+            #    references and rewriting the parent event_chain block
+            #    consistently — too large a surface area for a first repair.
+        ))
+    return issues
+
+# ── Repair ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class RepairAction:
+    kind: str
+    description: str
+    before: str = ""        # Text the repair removed/replaced (truncated if huge)
+    after: str = ""         # Text the repair inserted (truncated if huge)
+    line_start: int = -1    # 0-indexed
+    line_end: int = -1
+
+# Default ethic injected for zero-ethic empires. Egalitarian is a low-impact
+# choice: doesn't unlock fanatic-only bonuses, doesn't conflict with most
+# civics, and matches the "republic by default" convention many vanilla
+# rebel paths fall back to. The user can change ethics in-game post-load.
+DEFAULT_ETHIC = '\t\t\tethic="ethic_egalitarian"'
+
+def repair_inject_default_ethic(
+    lines: list[str], target: dict
+) -> tuple[list[str], RepairAction] | None:
+    """Inject a default ethic into an empty ethos={} block. Returns a new
+    list of lines (modified) plus a RepairAction describing the change."""
+    open_ln = target.get("ethos_open_line")
+    close_ln = target.get("ethos_close_line")
+    cid = target.get("country_id")
+    if open_ln is None or close_ln is None:
+        return None
+    # Sanity check: we expect lines[open_ln] to start with whitespace + ethos={
+    if not ETHOS_OPEN_RE.match(lines[open_ln]):
+        return None
+
+    # Two layout cases to handle:
+    # (a) single-line empty:  `\t\tethos={}`
+    # (b) multi-line empty:   `\t\tethos={`  ...  `\t\t}`  (no ethic= lines between)
+    if open_ln == close_ln:
+        # Replace `ethos={}` with multi-line block carrying one ethic.
+        original = lines[open_ln]
+        # Preserve the leading whitespace (typically two tabs).
+        leading = original[: len(original) - len(original.lstrip("\t"))]
+        new_lines = [
+            f"{leading}ethos={{",
+            DEFAULT_ETHIC,
+            f"{leading}}}",
+        ]
+        new = lines[:open_ln] + new_lines + lines[open_ln + 1:]
+        action = RepairAction(
+            kind="inject_default_ethic",
+            description=f"Country #{cid}: injected ethic_egalitarian into empty ethos={{}}",
+            before=original,
+            after="\n".join(new_lines),
+            line_start=open_ln,
+            line_end=open_ln,
+        )
+        return new, action
+    else:
+        # Multi-line empty — insert the ethic line right after `ethos={`.
+        new = lines[: open_ln + 1] + [DEFAULT_ETHIC] + lines[open_ln + 1:]
+        action = RepairAction(
+            kind="inject_default_ethic",
+            description=f"Country #{cid}: injected ethic_egalitarian into empty ethos block",
+            before=f"(empty block lines {open_ln}-{close_ln})",
+            after=DEFAULT_ETHIC,
+            line_start=open_ln + 1,
+            line_end=open_ln + 1,
+        )
+        return new, action
+
+REPAIR_DISPATCH = {
+    "inject_default_ethic": repair_inject_default_ethic,
+}
+
+def apply_repairs(
+    gamestate_text: str, issues: list[Issue]
+) -> tuple[str, list[RepairAction]]:
+    """Apply repairs for every issue with a known repair_kind. Returns the
+    rewritten gamestate text and the list of actions taken. Repairs are
+    applied in REVERSE line order so earlier line indices remain valid as
+    later regions are mutated."""
+    lines = gamestate_text.splitlines(keepends=True)
+    # Strip the keepends newlines so our line-index math matches splitlines().
+    # We re-add newlines on join.
+    lines = gamestate_text.split("\n")
+    repairable = [i for i in issues if i.repair_kind in REPAIR_DISPATCH]
+    # Sort by line position descending so mutations don't shift later indices.
+    repairable.sort(
+        key=lambda x: x.repair_target.get("ethos_open_line",
+                                          x.repair_target.get("line_start", 0)),
+        reverse=True,
+    )
+    actions = []
+    for issue in repairable:
+        fn = REPAIR_DISPATCH[issue.repair_kind]
+        result = fn(lines, issue.repair_target)
+        if result is None:
+            continue
+        lines, action = result
+        actions.append(action)
+    new_text = "\n".join(lines)
+    return new_text, actions
+
+def write_repaired_save(
+    src_path: Path, gamestate_text: str, dest_path: Path
+) -> None:
+    """Repackage a .sav with a modified gamestate. Reads original meta
+    + gamestate, replaces gamestate, writes a fresh zip to dest_path.
+    Original is never touched."""
+    with zipfile.ZipFile(src_path, "r") as src:
+        meta = src.read("meta")
+    with zipfile.ZipFile(dest_path, "w", compression=zipfile.ZIP_DEFLATED) as dst:
+        dst.writestr("meta", meta)
+        dst.writestr("gamestate", gamestate_text)
+
+# ── Reporting ──────────────────────────────────────────────────────────────
+
+def parse_meta_field(meta_text: str, key: str) -> str | None:
+    m = re.search(rf'^{re.escape(key)}="?([^"\n]+)"?\s*$', meta_text, re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+def _validate(save: Save) -> tuple[dict, list[Issue]]:
+    """Return (data_dict_for_reporting, raw_issue_list). Splitting these
+    out so the repair path can call the issue list directly without
+    round-tripping through dataclass→dict."""
+    name = parse_meta_field(save.meta_text, "name")
+    date = parse_meta_field(save.meta_text, "date")
+    version = parse_meta_field(save.meta_text, "version")
+    meta_fleets = parse_meta_field(save.meta_text, "meta_fleets")
+    meta_planets = parse_meta_field(save.meta_text, "meta_planets")
+
+    if save.is_ironman:
+        data = {
+            "path": str(save.path),
+            "ironman": True,
+            "name": name, "date": date, "version": version,
+            "meta_fleets": meta_fleets, "meta_planets": meta_planets,
+            "issues": [],
+            "ironman_note": (
+                "Ironman saves are binary-encoded — this tool does not parse them. "
+                "Convert to non-ironman in-game (load + Save As) to use save-doctor."
+            ),
+        }
+        return data, []
+
+    lines = save.gamestate_text.splitlines()
+    countries = iter_country_blocks(lines)
+    country_ids = {cid for cid, _, _ in countries}
+
+    issues: list[Issue] = []
+    issues.extend(validate_zero_ethic_empires(lines, countries))
+    issues.extend(validate_dangling_country_targets(save.gamestate_text, country_ids))
+
+    data = {
+        "path": str(save.path),
+        "ironman": False,
+        "name": name, "date": date, "version": version,
+        "meta_fleets": meta_fleets, "meta_planets": meta_planets,
+        "country_count": len(countries),
+        "country_ids": sorted(country_ids)[:10],
+        "gamestate_lines": len(lines),
+        "gamestate_bytes": len(save.gamestate_text),
+        "issues": [asdict(i) for i in issues],
+    }
+    return data, issues
+
+def collect(save: Save) -> dict:
+    data, _ = _validate(save)
+    return data
+
+def report_text(data: dict) -> None:
+    print()
+    print(bold("Stellaris save-doctor"))
+    print(dim("─" * 22))
+
+    hdr("Save")
+    line(f"File:               {data['path']}")
+    line(f"Empire:             {data.get('name') or '?'}")
+    line(f"In-game date:       {data.get('date') or '?'}")
+    line(f"Game version:       {data.get('version') or '?'}")
+    if data.get("meta_fleets"):
+        line(f"Meta fleets:        {data['meta_fleets']}")
+    if data.get("meta_planets"):
+        line(f"Meta planets:       {data['meta_planets']}")
+
+    if data.get("ironman"):
+        warn("This is an ironman save — gamestate is binary-encoded, validators skipped.")
+        line(dim(data.get("ironman_note", "")))
+        print()
+        return
+
+    line(f"Countries:          {data['country_count']}")
+    line(f"Gamestate size:     {data['gamestate_bytes']:,} bytes ({data['gamestate_lines']:,} lines)")
+
+    issues = data["issues"]
+    errors = [i for i in issues if i["severity"] == "error"]
+    warns  = [i for i in issues if i["severity"] == "warn"]
+    infos  = [i for i in issues if i["severity"] == "info"]
+
+    hdr(f"Issues — {len(errors)} error, {len(warns)} warn, {len(infos)} info")
+    if not issues:
+        ok("No corruption detected.")
+    else:
+        for i in errors:
+            fail(f"[{i['kind']}] {i['summary']}")
+        for i in warns:
+            warn(f"[{i['kind']}] {i['summary']}")
+        if infos:
+            line()
+            line(dim(f"Info-level findings ({len(infos)} total — usually benign; engine null-guards handle most):"))
+            shown = infos[:5]
+            for i in shown:
+                line(f"  {dim('•')} [{i['kind']}] {i['summary']}")
+            if len(infos) > len(shown):
+                line(f"  {dim(f'… {len(infos) - len(shown)} more (use --json for the full list)')}")
+
+    repairable = [i for i in errors + warns if i.get("repair_kind")]
+    if repairable:
+        hdr("Repair")
+        line(f"{len(repairable)} issue(s) auto-repairable.")
+        line(dim("Re-run with --repair to write <input>.repaired.sav with the fixes applied."))
+        line(dim("(Original save is never modified.)"))
+    print()
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Inspect (and optionally repair) a Stellaris .sav for state corruption."
+    )
+    ap.add_argument("save", type=Path, help="Path to a Stellaris .sav file")
+    ap.add_argument("--json", action="store_true", help="Output JSON instead of text")
+    ap.add_argument("--repair", action="store_true",
+                    help="Write <input>.repaired.sav with auto-repairable issues fixed. Original is never modified.")
+    ap.add_argument("--output", type=Path,
+                    help="Override the repaired output path (only meaningful with --repair).")
+    args = ap.parse_args()
+
+    if not args.save.exists():
+        sys.exit(f"No such file: {args.save}")
+    if not zipfile.is_zipfile(args.save):
+        sys.exit(f"Not a zip-format save (Stellaris .sav must be a zip): {args.save}")
+
+    save = read_save(args.save)
+    data, issues = _validate(save)
+
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        report_text(data)
+
+    # Repair phase
+    if args.repair:
+        if save.is_ironman:
+            print()
+            warn("Cannot --repair an ironman save (binary-encoded gamestate).")
+            sys.exit(2)
+        repairable = [i for i in issues if i.repair_kind in REPAIR_DISPATCH]
+        if not repairable:
+            print()
+            ok("Nothing to repair — no auto-repairable issues found.")
+            sys.exit(0)
+        new_text, actions = apply_repairs(save.gamestate_text, issues)
+        if not actions:
+            print()
+            warn("Repair functions found no applicable changes despite repairable issues. (Bug?)")
+            sys.exit(1)
+        out_path = args.output or args.save.with_suffix(args.save.suffix + ".repaired").with_name(
+            args.save.stem + ".repaired" + args.save.suffix
+        )
+        write_repaired_save(args.save, new_text, out_path)
+        print()
+        hdr(f"Repair — wrote {out_path}")
+        for a in actions:
+            line(f"  {green('✓')} {a.description}")
+            if a.line_start >= 0:
+                line(dim(f"      around line {a.line_start}"))
+        line()
+        line(dim("Verify by re-running save-doctor on the repaired file."))
+        line(dim("To use in-game: copy to your save-games dir or load directly."))
+        sys.exit(0)
+
+    # Exit code: 0 = no error/warn issues (info is fine), 1 = error or warn,
+    # 2 = ironman / unsupported.
+    if data.get("ironman"):
+        sys.exit(2)
+    if any(i["severity"] in ("error", "warn") for i in data["issues"]):
+        sys.exit(1)
+    sys.exit(0)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,61 @@
+#!/bin/bash
+#
+# stellaris-fix-drift-check — invoked by the launchd agent on game-binary changes.
+#
+# Reads the current __DATA vmaddr of the game binary, compares it to the
+# expected value baked into the installed dylib (via the sidecar written
+# by install.sh), and posts a macOS notification if they differ — so the
+# user knows to rebuild and reinstall the dylib after a Stellaris update.
+#
+# No external deps beyond /usr/bin/{otool,awk,osascript}.
+
+set -uo pipefail
+
+STELLARIS_DIR="${STELLARIS_DIR:-$HOME/Library/Application Support/Steam/steamapps/common/Stellaris}"
+GAME_BINARY="$STELLARIS_DIR/stellaris.app/Contents/MacOS/stellaris"
+SIDECAR="$HOME/.config/stellaris-mac-fixes/expected_text_end"
+LOG="/tmp/stellaris-fix-drift.log"
+
+ts() { date '+%Y-%m-%dT%H:%M:%S'; }
+log() { echo "$(ts) $*" >> "$LOG"; }
+
+# launchd may fire WatchPaths events repeatedly while Steam is mid-update
+# (multiple writes during file replacement). Debounce: sleep briefly and
+# only emit once per binary mtime.
+sleep 5
+
+if [ ! -x "$GAME_BINARY" ]; then
+    log "game binary missing: $GAME_BINARY"
+    exit 0
+fi
+
+if [ ! -f "$SIDECAR" ]; then
+    log "no sidecar at $SIDECAR — skipping (run install.sh once)"
+    exit 0
+fi
+
+EXPECTED=$(tr -d '[:space:]' < "$SIDECAR")
+ACTUAL=$(otool -l "$GAME_BINARY" 2>/dev/null \
+         | awk '/segname __DATA$/{f=1} f && /vmaddr/{print $2; exit}')
+
+if [ -z "$ACTUAL" ]; then
+    log "could not read __DATA vmaddr from $GAME_BINARY"
+    exit 0
+fi
+
+# Normalize for comparison (lowercase hex, leading zeros stripped via printf)
+norm() { printf '0x%x' "$1" 2>/dev/null; }
+EXPECTED_N=$(norm "$EXPECTED")
+ACTUAL_N=$(norm "$ACTUAL")
+
+if [ "$EXPECTED_N" = "$ACTUAL_N" ]; then
+    log "no drift: $ACTUAL_N"
+    exit 0
+fi
+
+log "DRIFT: expected=$EXPECTED_N actual=$ACTUAL_N — notifying user"
+
+# Post a macOS notification. osascript path is the system one, no PATH dep.
+/usr/bin/osascript -e "display notification \"Game binary __DATA shifted from $EXPECTED_N to $ACTUAL_N. Rebuild the dylib and reinstall.\" with title \"Stellaris Mac CTD Fixes — drift detected\" subtitle \"Stellaris updated\" sound name \"Sosumi\"" >> "$LOG" 2>&1 || true
+
+exit 0

@@ -13,6 +13,13 @@ DYLIB="libstellaris_fix.dylib"
 WRAPPER="stellaris_wrapper.sh"
 LAUNCHER="launcher-settings.json"
 
+COMPANION_MOD_NAME="stellaris-mac-fixes-companion"
+COMPANION_POINTER="$HOME/Documents/Paradox Interactive/Stellaris/mod/${COMPANION_MOD_NAME}.mod"
+
+SIDECAR_DIR="$HOME/.config/stellaris-mac-fixes"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/com.stellaris-fix.drift.plist"
+LAUNCHD_LABEL="com.stellaris-fix.drift"
+
 BOLD=$'\033[1m'
 GREEN=$'\033[32m'
 YELLOW=$'\033[33m'
@@ -56,6 +63,26 @@ DYLIB_PATH="$STELLARIS_DIR/$DYLIB"
 if [ -f "$DYLIB_PATH" ]; then
     rm "$DYLIB_PATH"
     ok "Removed $DYLIB"
+fi
+
+# Remove companion mod pointer (the mod files themselves stay in the repo)
+if [ -f "$COMPANION_POINTER" ]; then
+    rm "$COMPANION_POINTER"
+    ok "Removed companion-mod launcher pointer"
+fi
+
+# Unload + remove drift detector
+if [ -f "$LAUNCHD_PLIST" ]; then
+    launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL" 2>/dev/null \
+        || launchctl unload "$LAUNCHD_PLIST" 2>/dev/null || true
+    rm "$LAUNCHD_PLIST"
+    ok "Removed drift-detector launchd agent"
+fi
+
+# Remove sidecar (kept directory if other state was added later)
+if [ -d "$SIDECAR_DIR" ]; then
+    rm -rf "$SIDECAR_DIR"
+    ok "Removed sidecar directory $SIDECAR_DIR"
 fi
 
 step "Uninstall complete"

@@ -1,0 +1,49 @@
+# Planet-transfer null guard.
+#
+# Source: ~~Stellaris [v4.3] General Fixes — events/base_fixes.txt:33-69
+#         (base_fix.3, by vladimir, citing Paradox forum thread
+#         https://forum.paradoxplaza.com/forum/threads/stellaris-4-0-ai-economy.1902580/)
+#
+# Vanilla CTD: when an AI hive empire transfers an occupied planet to a non-hive
+# AI receiver, the receiver's economy code can deref a stale district/building
+# pointer during the planet-employment recompute. Source author flagged this
+# personally as "WARNING: CAN CAUSE CTD!".
+#
+# Fix mechanism: on_planet_transfer fires this; we add the missing existence /
+# scope-type guards on `fromfrom`, then preemptively remove all buildings and
+# districts so the receiver's recompute touches no stale references.
+
+namespace = smf
+
+planet_event = {
+	id = smf.1
+	hide_window = yes
+	is_triggered_only = yes
+
+	pre_triggers = {
+		has_owner = yes
+		is_occupied_flag = no
+		is_ai = yes
+	}
+
+	trigger = {
+		is_colony = yes
+		is_under_colonization = no
+		from = { is_ai = yes is_hive_empire = yes }
+		exists = fromfrom
+		fromfrom = { is_hive_empire = no }
+		has_district = yes
+	}
+
+	immediate = {
+		if = {
+			limit = { has_building = yes }
+			remove_all_buildings = yes
+		}
+		remove_all_districts = yes
+		if = {
+			limit = { pop_amount > 300 }
+			check_planet_employment = yes
+		}
+	}
+}

@@ -1,0 +1,95 @@
+# Nanite swarm anomaly re-enable on starbase transfer.
+#
+# Source: ~~Stellaris [v4.3] General Fixes — events/!ariphaos_patch_anomaly.txt
+#         (anomaly.16001/16002, originally written by FirePrince for "A Deadly Tempest")
+#
+# Vanilla bug: when a starbase changes hands while the STUDY_NANITE_SWARM
+# project is in progress, the project's event_target:nanite_swarm_planet
+# can dangle and the project becomes uncompletable. The fix detects the
+# stale state on starbase transfer and re-issues anomaly.16002 to re-enable
+# the Special Project on the planet.
+#
+# Note: this patch keeps vanilla's anomaly.16001 / anomaly.16002 IDs because
+# the source mod overrides them by the same mechanism (no replace_path).
+
+namespace = anomaly
+
+# Triggered from on_starbase_transfer (and on_building_starbase_outpost in
+# the source mod's own on_actions). Detects a planet in this system that
+# still has the nanite_swarm_modifier and a missing study project.
+ship_event = {
+	id = anomaly.16001
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		exists = solar_system
+		exists = event_target:nanite_swarm_planet
+		solar_system = {
+			any_system_planet = {
+				is_star = no
+				is_asteroid = no
+				has_planet_flag = colony_event
+				is_planet = event_target:nanite_swarm_planet
+				has_modifier = nanite_swarm_modifier
+			}
+		}
+		exists = owner
+		owner = {
+			NOT = { has_special_project = STUDY_NANITE_SWARM }
+		}
+	}
+
+	immediate = {
+		log = "SMF: re-enabling lost Nanite Swarm Project for [Owner.GetName]"
+		event_target:nanite_swarm_planet = {
+			planet_event = {
+				id = anomaly.16002
+				days = 3
+				scopes = { from = root.owner fromfrom = root }
+			}
+		}
+	}
+}
+
+# The actual anomaly window — same as vanilla, but defended by the trigger
+# above so we don't re-issue STUDY_NANITE_SWARM on a planet that still has
+# an active project.
+planet_event = {
+	id = anomaly.16002
+	title = "COLONIZABLE_ANOMALY"
+	desc = "NANO_SWARM_CAT_DESC"
+	picture = GFX_evt_desert
+	show_sound = event_radio_chatter
+	is_triggered_only = yes
+
+	trigger = {
+		has_planet_flag = colony_event
+		has_modifier = nanite_swarm_modifier
+		is_preventing_anomaly = yes
+		OR = {
+			NOT = { exists = event_target:nanite_swarm_planet }
+			is_planet = event_target:nanite_swarm_planet
+		}
+		exists = from
+		from = {
+			is_country_type = default
+			NOT = { has_special_project = STUDY_NANITE_SWARM }
+		}
+	}
+
+	immediate = {
+		log = "SMF: re-enable Nanite Swarm Project for [From.GetName]"
+		random_playable_country = {
+			limit = { has_special_project = STUDY_NANITE_SWARM }
+			abort_special_project = { type = STUDY_NANITE_SWARM location = root }
+		}
+		add_anomaly = { category = NANO_SWARM_CAT target = from }
+	}
+
+	option = {
+		name = ANOMALY_VIEW_CLOSE
+		custom_tooltip = ANOMALY_LEAVE_BE_DESC
+	}
+}
+

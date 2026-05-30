@@ -1,0 +1,305 @@
+# Titanic army cap defense + counter resync.
+#
+# Source: ~~Stellaris [v4.3] General Fixes — events/limited_army_counter_fix_events.txt
+#         + common/on_actions/limited_army_counter_fix_on_actions.txt
+#         (Corsairmarks 2021-2023, refactored by FirePrince 2024 for v3.14)
+#
+# Vanilla CTD: titanic life / azizian armies recruited beyond the per-planet
+# cap can crash the game during the recruit-completion path. The author's
+# comment: "Because of a possible crash, the army deletion occurs one day
+# after the 'over cap' army finishes being recruited." We over-recruit, then
+# refund and remove on the next day to avoid the immediate crash window.
+#
+# Counter accuracy: vanilla doesn't reliably decrement counters when armies
+# die in transports or get disbanded mid-air. We resync on save load + every
+# two years from owned-army truth, and decrement on each kill/disband event.
+
+namespace = smf
+
+# === Counter resync (save load + bi-yearly) ===
+# Recomputes titanic_life_soldier_count + max from owned planets + armies.
+event = {
+	id = smf.40
+	hide_window = yes
+	is_triggered_only = yes
+
+	immediate = {
+		every_playable_country = {
+			limit = { is_limited_army_country = yes }
+			# Titanic Life
+			if = {
+				limit = {
+					has_country_flag = titanic_life_soldiers
+					is_variable_set = titanic_life_soldier_count
+				}
+				set_variable = { which = titanic_life_soldier_maximum value = 0 }
+				every_owned_planet = {
+					limit = {
+						is_colony = yes
+						has_planet_flag = titanic_life_can_build
+					}
+					prev = { increment_titanic_life_soldier_maximum = yes }
+				}
+				if = {
+					limit = {
+						check_variable = { which = titanic_life_soldier_maximum value > 0 }
+					}
+					if = {
+						limit = { NOT = { is_variable_set = titanic_life_soldier_queued_count } }
+						set_variable = { which = titanic_life_soldier_queued_count value = 0 }
+					}
+					set_variable = { which = titanic_life_soldier_count value = 0 }
+					every_owned_army = {
+						limit = { army_type = titanic_assault_army }
+						prev = {
+							change_variable = { which = titanic_life_soldier_count value = 1 }
+						}
+					}
+				}
+				else = {
+					clear_variable = titanic_life_soldier_count
+					clear_variable = titanic_life_soldier_queued_count
+					clear_variable = titanic_life_soldier_maximum
+				}
+			}
+			# Titanic Azizian
+			if = {
+				limit = {
+					has_country_flag = titanic_azizian_soldiers
+					is_variable_set = titanic_azizian_soldier_count
+				}
+				if = {
+					limit = {
+						any_owned_planet = { is_colony = yes has_planet_flag = titanic_azizian_can_build }
+					}
+					if = {
+						limit = { NOT = { is_variable_set = titanic_azizian_soldier_queued_count } }
+						set_variable = { which = titanic_azizian_soldier_queued_count value = 0 }
+					}
+					set_variable = { which = titanic_azizian_soldier_count value = 0 }
+					every_owned_army = {
+						limit = { army_type = titanic_azizian_assault_army }
+						prev = {
+							change_variable = { which = titanic_azizian_soldier_count value = 1 }
+						}
+					}
+				}
+				else = {
+					clear_variable = titanic_azizian_soldier_count
+					clear_variable = titanic_azizian_soldier_queued_count
+				}
+			}
+		}
+	}
+}
+
+# === On planet transfer: hand off counter ownership ===
+planet_event = {
+	id = smf.41
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		OR = {
+			has_planet_flag = titanic_life_can_build
+			has_modifier = "titanic_life"
+		}
+	}
+
+	immediate = {
+		if = {
+			limit = { has_planet_flag = titanic_life_can_build }
+			if = {
+				limit = {
+					exists = from
+					from = { is_scope_type = country has_country_flag = titanic_life_soldiers }
+				}
+				from = { increment_titanic_life_soldier_maximum = yes }
+			}
+			if = {
+				limit = {
+					exists = fromfrom
+					fromfrom = { is_scope_type = country has_country_flag = titanic_life_soldiers }
+				}
+				fromfrom = { decrement_titanic_life_soldier_maximum = yes }
+			}
+		}
+	}
+}
+
+# === On colonization: increment max ===
+planet_event = {
+	id = smf.42
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		has_planet_flag = titanic_life_can_build
+		has_owner = yes
+		owner = { has_country_flag = titanic_life_soldiers }
+	}
+
+	immediate = {
+		owner = { increment_titanic_life_soldier_maximum = yes }
+	}
+}
+
+# === On colony destroyed: decrement max ===
+planet_event = {
+	id = smf.43
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		has_planet_flag = titanic_life_can_build
+		has_owner = yes
+		owner = { has_country_flag = titanic_life_soldiers }
+	}
+
+	immediate = {
+		owner = { decrement_titanic_life_soldier_maximum = yes }
+	}
+}
+
+# === On army recruited: cap-overflow check + delayed refund ===
+# from = army
+planet_event = {
+	id = smf.44
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		exists = from
+		from = { is_limited_army = yes }
+	}
+
+	immediate = {
+		from = {
+			switch = { trigger = army_type
+				titanic_assault_army = {
+					owner = {
+						if = {
+							limit = { check_variable = { which = titanic_life_soldier_queued_count value > 0 } }
+							subtract_variable = { which = titanic_life_soldier_queued_count value = 1 }
+						}
+						if = {
+							limit = { has_available_titanic_life_capacity = yes }
+							change_variable = { which = titanic_life_soldier_count value = 1 }
+						}
+						else = {
+							country_event = { id = smf.48 days = 1 scopes = { from = prev } }
+						}
+					}
+				}
+				titanic_azizian_assault_army = {
+					owner = {
+						if = {
+							limit = { check_variable = { which = titanic_azizian_soldier_queued_count value > 0 } }
+							subtract_variable = { which = titanic_azizian_soldier_queued_count value = 1 }
+						}
+						if = {
+							limit = { has_available_titanic_azizian_capacity = yes }
+							change_variable = { which = titanic_azizian_soldier_count value = 1 }
+						}
+						else = {
+							country_event = { id = smf.48 days = 1 scopes = { from = prev } }
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+# === On army killed (combat or non-combat): decrement counter ===
+country_event = {
+	id = smf.45
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		exists = from
+		NOT = { has_country_flag = army_counter_decremented@from }
+		from = { is_limited_army = yes }
+	}
+
+	immediate = {
+		from = { decrement_army_count = yes }
+	}
+}
+
+# === On army disbanded ===
+country_event = {
+	id = smf.46
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		exists = from
+		from = {
+			NOT = { exists = fleet }
+			is_limited_army = yes
+		}
+		NOT = { has_country_flag = army_counter_decremented@prev }
+		is_limited_army_country = yes
+	}
+
+	immediate = {
+		from = { decrement_army_count = yes }
+	}
+}
+
+# === On ship disbanded (transport carrying limited armies) ===
+country_event = {
+	id = smf.47
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		exists = from
+		from = { is_ship_class = shipclass_transport }
+		is_limited_army_country = yes
+		any_owned_army = {
+			exists = fleet
+			fleet = { is_same_value = from.fleet }
+			is_limited_army = yes
+		}
+	}
+
+	immediate = {
+		random_owned_army = {
+			limit = {
+				exists = fleet
+				fleet = { is_same_value = from.fleet }
+				is_limited_army = yes
+				root = {
+					NOT = { has_country_flag = army_counter_decremented@prev }
+				}
+			}
+			decrement_army_count = yes
+		}
+	}
+}
+
+# === Refund + remove an over-cap army (one-day delayed to avoid crash) ===
+country_event = {
+	id = smf.48
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		exists = from
+		from = { is_limited_army = yes }
+	}
+
+	immediate = {
+		set_timed_country_flag = { flag = army_counter_decremented@from days = 7 }
+		from = {
+			switch = { trigger = army_type
+				titanic_assault_army         = { root = { add_resource = { minerals = 300 } } }
+				titanic_azizian_assault_army = { root = { add_resource = { minerals = 250 energy = 50 } } }
+			}
+			remove_army = yes
+		}
+	}
+}

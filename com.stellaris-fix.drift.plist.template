@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template — install.sh substitutes @REPO_ROOT@ and @GAME_BINARY@ with
+  absolute paths, then writes the resolved plist to
+  ~/Library/LaunchAgents/com.stellaris-fix.drift.plist and loads it via
+  launchctl.
+
+  WatchPaths fires when the watched file is modified (Steam game update).
+  ThrottleInterval rate-limits triggers to one per 60s; the script itself
+  sleeps 5s on top to coalesce multi-write update sequences.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.stellaris-fix.drift</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>@REPO_ROOT@/bin/stellaris-fix-drift-check</string>
+	</array>
+	<key>WatchPaths</key>
+	<array>
+		<string>@GAME_BINARY@</string>
+	</array>
+	<key>ThrottleInterval</key>
+	<integer>60</integer>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardOutPath</key>
+	<string>/tmp/stellaris-fix-drift.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/stellaris-fix-drift.log</string>
+</dict>
+</plist>

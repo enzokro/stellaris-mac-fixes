@@ -1,0 +1,8 @@
+﻿l_english:
+
+ worm_tweak.1.title:0 "Horizon Signal Configuration"
+ worm_tweak.1.desc:0 "A strange resonance troubles the fabric of space. How often should the Worm-in-Waiting find its way into your galaxy?\n\nThis setting is applied once, at game start, and cannot be changed later."
+ worm_tweak.1.a:0 "§YGuarantee§! — every black hole whispers"
+ worm_tweak.1.b:0 "§HHigh§! — 75% chance, every black hole"
+ worm_tweak.1.c:0 "Vanilla — 20% chance, one random black hole"
+ worm_tweak.1.d:0 "§RDisable§! — Horizon Signal will not spawn"

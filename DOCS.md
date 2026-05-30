@@ -105,7 +105,7 @@ STELLARIS_FIX_DEBUG=1 %command%
 Then check the terminal output (or run Stellaris from Terminal) — you'll see messages like:
 
 ```
-[stellaris-fix] v1.2.0 loaded
+[stellaris-fix] v1.4.0 loaded
 [stellaris-fix]   target stack: 8 MiB, floor: 1 MiB
 [stellaris-fix]   fd soft limit raised to 8192
 [stellaris-fix]   SIGSEGV recovery handler installed
@@ -114,11 +114,14 @@ Then check the terminal output (or run Stellaris from Terminal) — you'll see m
 ...
 ```
 
-If the recovery handler catches a crash, you'll see:
+If the recovery handler catches a crash, you'll see one of:
 
 ```
-[stellaris-fix] recovered: NULL-page call (execution at invalid address)
+[stellaris-fix] recovered: bad-RIP call (direct ret)
+[stellaris-fix] recovered: bad-RIP call (stack scan)
 ```
+
+The `direct ret` path handles crashes where the bad call came from Stellaris itself. The `stack scan` path handles crashes where it ended up inside an Apple GL/Metal driver call (e.g. during border rendering); the handler walks the stack to find the Stellaris frame that initiated the chain and unwinds to it.
 
 ---
 
@@ -137,7 +140,7 @@ This restores `launcher-settings.json` from backup and removes the dylib and wra
 ## Compatibility
 
 - **macOS**: 11 (Big Sur) or later, tested on 26.4
-- **Stellaris**: v4.3.3 (Cetus), likely works on earlier and later versions — the fixes target stable POSIX APIs
+- **Stellaris**: tested through v4.3.5 (Cetus). Fix 1 (stack size) and Fix 2 (file descriptors) target stable POSIX APIs and aren't version-sensitive. Fix 3 (SIGSEGV recovery) hard-codes the Stellaris `__TEXT` segment range, which can shift across game updates — if a Stellaris update lands and crashes resume, rebuild from source against the new binary (the constant lives in `stellaris_fix.c`, with a verification one-liner alongside it).
 - **Architecture**: Universal binary (arm64 + x86_64). Works on Intel Macs natively and Apple Silicon under Rosetta 2.
 - **System Integrity Protection**: Fully compatible — the game binary is unsigned so `DYLD_INSERT_LIBRARIES` works without needing SIP disabled.
 - **Steam**: Yes. Other stores (Epic, GOG, Paradox Store) should work if the layout matches; use `STELLARIS_DIR`.
@@ -199,7 +202,7 @@ The library uses two macOS-specific mechanisms:
 
 1. **DYLD interposition** via the `__DATA,__interpose` Mach-O section to intercept `pthread_create`, `pthread_attr_init`, `pthread_attr_setstacksize`, and `sigaction`. The dynamic linker replaces references to these symbols in the game and all other loaded images with our versions. Calls within our own library still go to the real functions, so there's no recursion.
 
-2. **Signal-handler recovery** for crashes that can't be intercepted via DYLD (because they happen through direct intra-binary calls). A SIGSEGV handler detects the "NULL-page execution" crash signature and unwinds by simulating a `ret` instruction in the signal context.
+2. **Signal-handler recovery** for crashes that can't be intercepted via DYLD (because they happen through direct intra-binary calls or through Apple-driver call chains). A SIGSEGV handler detects instruction-fetch faults (where the faulting address equals the current `RIP` — the canonical signature of a corrupted function-pointer call) and unwinds by either simulating a `ret` instruction directly, or scanning the stack to find the originating Stellaris frame and unwinding to it when the bad call happened inside an Apple driver.
 
 The library is loaded via `DYLD_INSERT_LIBRARIES` — this requires the target binary to be either unsigned or have the `com.apple.security.cs.disable-library-validation` entitlement. The Stellaris macOS build is unsigned, so injection works without needing SIP to be disabled.
 

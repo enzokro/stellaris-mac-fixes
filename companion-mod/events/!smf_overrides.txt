@@ -1,0 +1,430 @@
+# Vanilla event-ID overrides.
+#
+# This file is intentionally `!`-prefixed so it loads AFTER vanilla's
+# crisis_events_*.txt and marauder_*.txt. Stellaris's event-ID precedence
+# is "later loaded wins", so our redefinitions here override vanilla
+# without requiring `replace_path` in descriptor.mod (which would force us
+# to copy and maintain the entire vanilla file).
+#
+# Sources from ~~Stellaris [v4.3] General Fixes:
+#   - events/!crisis_events_fix_patch.txt — crisis.233, .1015, .1284, .1611
+#     (Vfix by FirePrince 12/2025)
+#   - events/marauder_border_events_override.txt — marauder.609
+#
+# Conflicts: any other mod that also redefines these IDs. The known case is
+# the source General Fixes mod itself — do not run both at the same time.
+
+namespace = crisis
+
+# === crisis.233 — Sentinel Reinforcements (HIDDEN on_five_year_pulse) ===
+# Vanilla can spawn Sentinel reinforcements after the swarm is gone if
+# the global flags are stale. Adds an existence guard for sentinel_alpha.
+event = {
+	id = crisis.233
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		has_global_flag = ongoing_prethoryn_invasion
+		has_global_flag = sentinels_founded
+		exists = event_target:sentinel_alpha
+		any_country = { is_country_type = sentinels num_ships < 200 }
+	}
+
+	immediate = {
+		event_target:sentinel_alpha = {
+			fleet_event = { id = crisis.60 }
+		}
+	}
+}
+
+# === crisis.1015 — Portal Destroyed (HIDDEN on_fleet_destroyed_victim) ===
+# Vanilla switches on is_country_type for extradimensional/_2/_3 only.
+# Adds a `portal_holder` fallback case that re-routes via owned-ship flags
+# when the type collapses to portal_holder during cascade destruction.
+country_event = {
+	id = crisis.1015
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		has_global_flag = extradimensional_invasion_happened
+		OR = {
+			is_country_type = extradimensional
+			is_country_type = extradimensional_2
+			is_country_type = extradimensional_3
+			is_country_type = portal_holder
+		}
+		fromfrom = { is_ship_size = dimensional_portal_ed }
+	}
+
+	immediate = {
+		log = "SMF: [This.GetName] Portal Destroyed"
+		switch = {
+			trigger = is_country_type
+			extradimensional   = { country_event = { id = crisis.1012 } }
+			extradimensional_2 = { country_event = { id = crisis.1115 } }
+			extradimensional_3 = { country_event = { id = crisis.1215 } }
+			portal_holder = {
+				fromfrom = {
+					log = "SMF: unorthodox Portal Destroyed (portal_holder fallback)"
+					if = { limit = { any_owned_ship = { has_ship_flag = unbidden_portal } }  event_target:extradimensionals  = { country_event = { id = crisis.1012 } } }
+					else_if = { limit = { any_owned_ship = { has_ship_flag = aberrant_portal } } event_target:extradimensionals2 = { country_event = { id = crisis.1115 } } }
+					else_if = { limit = { any_owned_ship = { has_ship_flag = vehement_portal } } event_target:extradimensionals3 = { country_event = { id = crisis.1215 } } }
+				}
+			}
+		}
+	}
+}
+
+# === crisis.1284 — Anchor Destroyed (HIDDEN on_starbase_destroyed) ===
+# Vanilla can deref a null event_target:portal_holder during cascade
+# destruction of dimensional anchors. We construct a portal_holder_1
+# fallback target and route through it.
+starbase_event = {
+	id = crisis.1284
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		OR = {
+			has_starbase_size = starbase_exd_0
+			has_starbase_size = starbase_exd
+		}
+		has_global_flag = extradimensional_invasion_happened
+		exists = owner
+		owner = {
+			OR = {
+				is_country_type = extradimensional
+				is_country_type = extradimensional_2
+				is_country_type = extradimensional_3
+			}
+		}
+	}
+
+	immediate = {
+		# Construct fallback target if missing
+		if = {
+			limit = { NOT = { exists = event_target:portal_holder_1 } }
+			random_country = {
+				limit = { is_country_type = portal_holder }
+				save_global_event_target_as = portal_holder_1
+			}
+		}
+		owner = {
+			save_event_target_as = starbase_exd_owner
+			switch = {
+				trigger = is_country_type
+				extradimensional = {
+					every_playable_country = {
+						limit = { has_event_chain = "extradimensional_invasion_chain" }
+						add_event_chain_counter = {
+							event_chain = "extradimensional_invasion_chain"
+							counter = "dimensional_anchors_1"
+							amount = -1
+						}
+					}
+					if = {
+						limit = { NOT = { any_controlled_fleet = { is_ship_size = starbase_exd } } }
+						event_target:portal_holder_1 = {
+							random_controlled_ship = {
+								limit = {
+									is_ship_size = dimensional_portal_ed
+									has_ship_flag = unbidden_portal
+								}
+								fleet = { set_controller = root set_event_locked = no }
+							}
+						}
+					}
+				}
+				extradimensional_2 = {
+					every_playable_country = {
+						limit = { has_event_chain = "extradimensional_invasion_chain_2" }
+						add_event_chain_counter = {
+							event_chain = "extradimensional_invasion_chain_2"
+							counter = "dimensional_anchors_2"
+							amount = -1
+						}
+					}
+					if = {
+						limit = { NOT = { any_controlled_fleet = { is_ship_size = starbase_exd } } }
+						event_target:portal_holder_1 = {
+							random_controlled_ship = {
+								limit = {
+									is_ship_size = dimensional_portal_ed
+									has_ship_flag = aberrant_portal
+								}
+								fleet = { set_controller = root set_event_locked = no }
+							}
+						}
+					}
+				}
+				extradimensional_3 = {
+					every_playable_country = {
+						limit = { has_event_chain = "extradimensional_invasion_chain_3" }
+						add_event_chain_counter = {
+							event_chain = "extradimensional_invasion_chain_3"
+							counter = "dimensional_anchors_3"
+							amount = -1
+						}
+					}
+					if = {
+						limit = { NOT = { any_controlled_fleet = { is_ship_size = starbase_exd } } }
+						event_target:portal_holder_1 = {
+							random_controlled_ship = {
+								limit = {
+									is_ship_size = dimensional_portal_ed
+									has_ship_flag = vehement_portal
+								}
+								fleet = { set_controller = root set_event_locked = no }
+							}
+						}
+					}
+				}
+			}
+			if = {
+				limit = {
+					event_target:portal_holder_1 = {
+						any_owned_ship = {
+							is_ship_size = dimensional_portal_ed
+							OR = {
+								is_controlled_by = prevprev
+								AND = {
+									NOT = { is_within_borders_of = prevprev }
+									OR = {
+										AND = {
+											prevprev = { has_country_flag = unbidden }
+											has_ship_flag = unbidden_portal
+										}
+										AND = {
+											prevprev = { has_country_flag = aberrant }
+											has_ship_flag = aberrant_portal
+										}
+										AND = {
+											prevprev = { has_country_flag = vehement }
+											has_ship_flag = vehement_portal
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+				country_event = { id = crisis.1611 }
+			}
+		}
+		# Remove ambient effect
+		solar_system = {
+			random_system_ambient_object = {
+				limit = { has_ambient_object_flag = extradimensional_system_effect }
+				destroy_ambient_object = this
+			}
+		}
+	}
+
+	# Vfix double-check (very important event, worth re-validating after)
+	after = {
+		event_target:starbase_exd_owner = {
+			if = {
+				limit = {
+					NOT = {
+						any_controlled_fleet = {
+							OR = {
+								is_ship_size = starbase_exd
+								is_ship_size = starbase_exd_0
+								is_ship_size = dimensional_portal_ed
+							}
+						}
+					}
+				}
+				event_target:portal_holder_1 = {
+					random_owned_ship = {
+						limit = {
+							is_ship_size = dimensional_portal_ed
+							OR = {
+								AND = {
+									prevprev = { has_country_flag = unbidden }
+									has_ship_flag = unbidden_portal
+								}
+								AND = {
+									prevprev = { has_country_flag = aberrant }
+									has_ship_flag = aberrant_portal
+								}
+								AND = {
+									prevprev = { has_country_flag = vehement }
+									has_ship_flag = vehement_portal
+								}
+							}
+						}
+						fleet = { set_controller = prevprev set_event_locked = no }
+					}
+				}
+			}
+		}
+	}
+}
+
+# === crisis.1611 — Full Fallback to Portal ===
+# Re-routes orphaned crisis fleets back to the portal system when the
+# dimensional anchors collapse. Adds null-checks for dimensional_portal_system
+# event target and assigns idle commanders to leaderless fleets.
+country_event = {
+	id = crisis.1611
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = { }
+
+	immediate = {
+		if = {
+			limit = { NOT = { exists = event_target:dimensional_portal_system } }
+			random_controlled_fleet = {
+				limit = { is_ship_size = dimensional_portal_ed }
+				solar_system = { save_event_target_as = dimensional_portal_system }
+			}
+		}
+		every_owned_fleet = {
+			limit = {
+				is_mobile = yes
+				exists = solar_system
+				NOR = {
+					is_civilian = yes
+					is_garrison = yes
+					solar_system = {
+						OR = {
+							has_star_flag = extradimensional_origin_system
+							has_star_flag = extradimensional_second_portal_system
+							has_star_flag = extradimensional_third_portal_system
+						}
+					}
+				}
+			}
+			solar_system = {
+				prev = {
+					if = {
+						limit = { is_in_combat = yes }
+						auto_move_to_planet = {
+							target = event_target:dimensional_portal_system.star
+							clear_auto_move_on_arrival = yes
+						}
+					}
+					else_if = {
+						limit = { can_go_mia = yes }
+						remove_auto_move_target = yes
+						clear_fleet_actions = this
+						set_mia = mia_return_home
+					}
+					else = {
+						order_forced_return = yes
+					}
+				}
+			}
+			# Assign leader if missing
+			if = {
+				limit = {
+					NOT = { exists = leader }
+					root = {
+						any_owned_leader = {
+							leader_class = commander
+							is_idle = yes
+							NOR = {
+								exists = fleet
+								is_councilor = yes
+								is_ruler = yes
+							}
+						}
+					}
+				}
+				root = {
+					random_owned_leader = {
+						limit = {
+							leader_class = commander
+							is_idle = yes
+							NOR = {
+								is_councilor = yes
+								is_ruler = yes
+								exists = fleet
+							}
+						}
+						prevprev = { assign_leader = prev }
+					}
+				}
+			}
+		}
+	}
+}
+
+# === marauder.609 — Marauder country handover (HIDDEN, by marauder.602/.603/.604) ===
+# Vanilla khan-succession can deref a stale event_target:new_khanate. We
+# add scope-validity checks and a structured fallback chain (last_created_country
+# → from → break-out if no valid successor exists).
+
+namespace = marauder
+
+country_event = {
+	id = marauder.609
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		is_scope_valid = yes
+		is_scope_type = country
+		has_global_flag = marauder_crisis_started
+		exists = event_target:raider_khanate
+	}
+
+	immediate = {
+		# Try last_created_country (origin_khan_successor) first
+		if = {
+			limit = {
+				OR = {
+					NOT = { exists = event_target:new_khanate }
+					is_same_value = event_target:new_khanate
+				}
+				exists = last_created_country
+				last_created_country = { has_origin = origin_khan_successor }
+			}
+			last_created_country = { save_event_target_as = new_khanate }
+		}
+		# Fall back to from (the destroyed marauder/subject)
+		if = {
+			limit = {
+				OR = {
+					NOT = { exists = event_target:new_khanate }
+					is_same_value = event_target:new_khanate
+				}
+				exists = from
+				from = {
+					is_ai = yes
+					OR = {
+						is_marauder = yes
+						is_subject_of_khan = yes
+					}
+				}
+			}
+			from = { save_event_target_as = new_khanate }
+		}
+		# If still nothing valid, abort cleanly
+		if = {
+			limit = {
+				OR = {
+					NAND = {
+						exists = event_target:new_khanate
+						event_target:new_khanate = {
+							OR = {
+								is_scope_valid = yes
+								is_scope_type = country
+							}
+						}
+					}
+					is_same_value = event_target:new_khanate
+				}
+			}
+			break = yes
+		}
+		# (The vanilla fleet-dragging logic that follows in the source mod
+		# is untouched here — vanilla itself runs the rest of marauder.609
+		# after our trigger-only guard. Our override exists only to harden
+		# the front-half scope-resolution.)
+	}
+}

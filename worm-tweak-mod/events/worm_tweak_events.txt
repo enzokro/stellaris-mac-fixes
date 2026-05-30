@@ -1,0 +1,126 @@
+############################################
+# Worm Tweak — configuration + applier     #
+############################################
+
+namespace = worm_tweak
+
+# Trampoline: fires once from on_game_start_country, schedules the popup for
+# day 1 so the UI is ready and the popup isn't eaten during country init.
+country_event = {
+	id = worm_tweak.0
+	hide_window = yes
+	is_triggered_only = yes
+
+	trigger = {
+		is_ai = no
+		is_country_type = default
+		NOT = { has_global_flag = worm_tweak_processed }
+		NOT = { has_country_flag = worm_tweak_scheduled }
+	}
+
+	immediate = {
+		set_country_flag = worm_tweak_scheduled
+		country_event = { id = worm_tweak.1 days = 1 }
+	}
+}
+
+# Popup: asks the player how often the Worm should spawn.
+country_event = {
+	id = worm_tweak.1
+	title = "worm_tweak.1.title"
+	desc = "worm_tweak.1.desc"
+	picture = GFX_evt_black_hole
+	show_sound = event_alien_signal
+	is_triggered_only = yes
+
+	trigger = {
+		is_ai = no
+		NOT = { has_global_flag = worm_tweak_processed }
+	}
+
+	option = {
+		name = "worm_tweak.1.a"
+		set_country_flag = worm_choice_guarantee
+		hidden_effect = { country_event = { id = worm_tweak.2 days = 0 } }
+	}
+	option = {
+		name = "worm_tweak.1.b"
+		set_country_flag = worm_choice_high
+		hidden_effect = { country_event = { id = worm_tweak.2 days = 0 } }
+	}
+	option = {
+		name = "worm_tweak.1.c"
+		set_country_flag = worm_choice_vanilla
+		hidden_effect = { country_event = { id = worm_tweak.2 days = 0 } }
+	}
+	option = {
+		name = "worm_tweak.1.d"
+		set_country_flag = worm_choice_disable
+		hidden_effect = { country_event = { id = worm_tweak.2 days = 0 } }
+	}
+}
+
+# Applier: sets the global flag (so vanilla akx.8000 no-op stays a no-op and
+# any further popups bail out) and flags black holes based on the player's
+# choice.
+country_event = {
+	id = worm_tweak.2
+	hide_window = yes
+	is_triggered_only = yes
+
+	immediate = {
+		set_global_flag = worm_tweak_processed
+
+		if = {
+			limit = { has_country_flag = worm_choice_guarantee }
+			every_system = {
+				limit = {
+					is_star_class = sc_black_hole
+					is_fe_cluster = no
+					NOR = {
+						exists = starbase
+						has_star_flag = guardian
+						has_star_flag = empire_cluster
+					}
+				}
+				set_star_flag = horizonsignal_spawn
+			}
+		}
+		else_if = {
+			limit = { has_country_flag = worm_choice_high }
+			random_list = {
+				75 = {
+					every_system = {
+						limit = {
+							is_star_class = sc_black_hole
+							is_fe_cluster = no
+							NOR = {
+								exists = starbase
+								has_star_flag = guardian
+								has_star_flag = empire_cluster
+							}
+						}
+						set_star_flag = horizonsignal_spawn
+					}
+				}
+				25 = { }
+			}
+		}
+		else_if = {
+			limit = { has_country_flag = worm_choice_vanilla }
+			random_system = {
+				limit = {
+					is_star_class = sc_black_hole
+					is_fe_cluster = no
+					NOR = {
+						exists = starbase
+						has_star_flag = guardian
+						has_star_flag = empire_cluster
+					}
+				}
+				set_star_flag = horizonsignal_spawn
+			}
+		}
+		# worm_choice_disable: no-op
+	}
+}
